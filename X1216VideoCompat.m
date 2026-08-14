@@ -6,6 +6,7 @@
 
 static const NSInteger BHTVideoDownloadButtonTag = 1216099;
 static const void *BHTVideoItemKey = &BHTVideoItemKey;
+static const void *BHTActiveDownloaderKey = &BHTActiveDownloaderKey;
 static IMP BHTOriginalTableCellForItemIMP = NULL;
 
 typedef UITableViewCell *(*BHTTableCellForItemIMP)(id, SEL, id, id);
@@ -107,13 +108,40 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     if (!cell) return;
 
     UIView *actionsView = BHTFindActionsView(cell);
-    id viewModel = BHTVideoViewModelForCell(cell);
+    id viewModel = nil;
+
+    // Prefer the live actions-view model at tap time. This is the model that
+    // X 12.16 has already populated with representedMediaEntities/videoInfo.
+    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
+    if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
+        id liveModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
+        if (liveModel && BHTRuntimeItemIsVideo(liveModel)) {
+            viewModel = liveModel;
+        }
+    }
+
+    if (!viewModel) {
+        viewModel = BHTVideoViewModelForCell(cell);
+    }
     if (!viewModel) return;
 
+    // Reuse BHTwitter's existing downloader. It already implements the quality
+    // menu, MP4/M3U8 paths, progress HUD, share sheet/direct-save, and error UI.
     BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
     downloadButton.delegate = (id)actionsView;
     downloadButton.viewModel = viewModel;
-    [downloadButton DownloadHandler:nil];
+
+    // Keep the helper alive for the whole menu/download flow. The original
+    // inline button normally stays retained by X's actions view; our synthetic
+    // helper would otherwise be only a local variable.
+    objc_setAssociatedObject(sender,
+                             BHTActiveDownloaderKey,
+                             downloadButton,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [downloadButton DownloadHandler:sender];
+    });
 }
 
 @end
@@ -125,8 +153,8 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     UIButton *button = (UIButton *)[host viewWithTag:BHTVideoDownloadButtonTag];
     id viewModel = BHTVideoViewModelForCell(cell);
 
-    // Deliberately do not gate this with [BHTManager DownloadingVideos] yet.
-    // The old setting can be reconnected after X 12.16 detection is proven.
+    // Do not gate visibility with the legacy preference yet; X 12.16 video
+    // detection is now the source of truth for whether this control is shown.
     if (!viewModel) {
         [button removeFromSuperview];
         return;
@@ -170,8 +198,6 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
 static void BHTScheduleVideoButtonEvaluation(UITableViewCell *cell) {
     if (!cell) return;
 
-    // X 12.16 finishes wiring the inline actions/viewModel after the table cell
-    // has already been returned. Evaluate again after that hierarchy is ready.
     dispatch_async(dispatch_get_main_queue(), ^{
         BHTApplyVideoButtonToCell(cell);
     });
@@ -235,7 +261,7 @@ static void BHTInstallVideoTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed delayed video-only download button");
+    NSLog(@"[BHTwitter][X12.16] Installed delayed video download button with downloader bridge");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
