@@ -7,6 +7,7 @@
 static const NSInteger BHTVideoDownloadButtonTag = 1216099;
 static const void *BHTVideoItemKey = &BHTVideoItemKey;
 static const void *BHTActiveDownloaderKey = &BHTActiveDownloaderKey;
+static const void *BHTActiveDownloadProxyKey = &BHTActiveDownloadProxyKey;
 static IMP BHTOriginalTableCellForItemIMP = NULL;
 
 typedef UITableViewCell *(*BHTTableCellForItemIMP)(id, SEL, id, id);
@@ -83,6 +84,17 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     return nil;
 }
 
+// BHDownloadInlineButton's legacy DownloadHandler expects delegate.viewModel and
+// delegate.delegate. X 12.16's dedicated button is not an inline-action child,
+// so provide exactly that interface without depending on the old view hierarchy.
+@interface BHTDownloadDelegateProxy : NSObject
+@property (nonatomic, strong) id viewModel;
+@property (nonatomic, weak) id delegate;
+@end
+
+@implementation BHTDownloadDelegateProxy
+@end
+
 @interface BHTVideoDownloadTarget : NSObject
 @end
 
@@ -110,8 +122,6 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     UIView *actionsView = BHTFindActionsView(cell);
     id viewModel = nil;
 
-    // Prefer the live actions-view model at tap time. This is the model that
-    // X 12.16 has already populated with representedMediaEntities/videoInfo.
     SEL viewModelSEL = NSSelectorFromString(@"viewModel");
     if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
         id liveModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
@@ -120,20 +130,23 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
         }
     }
 
-    if (!viewModel) {
-        viewModel = BHTVideoViewModelForCell(cell);
-    }
+    if (!viewModel) viewModel = BHTVideoViewModelForCell(cell);
     if (!viewModel) return;
 
-    // Reuse BHTwitter's existing downloader. It already implements the quality
-    // menu, MP4/M3U8 paths, progress HUD, share sheet/direct-save, and error UI.
+    BHTDownloadDelegateProxy *proxy = [BHTDownloadDelegateProxy new];
+    proxy.viewModel = viewModel;
+    proxy.delegate = nil;
+
     BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
-    downloadButton.delegate = (id)actionsView;
+    downloadButton.delegate = (id)proxy;
     downloadButton.viewModel = viewModel;
 
-    // Keep the helper alive for the whole menu/download flow. The original
-    // inline button normally stays retained by X's actions view; our synthetic
-    // helper would otherwise be only a local variable.
+    // Both properties above are weak/temporary in the legacy inline-action path.
+    // Keep the bridge and downloader alive until the menu/download flow finishes.
+    objc_setAssociatedObject(sender,
+                             BHTActiveDownloadProxyKey,
+                             proxy,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(sender,
                              BHTActiveDownloaderKey,
                              downloadButton,
@@ -153,8 +166,6 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     UIButton *button = (UIButton *)[host viewWithTag:BHTVideoDownloadButtonTag];
     id viewModel = BHTVideoViewModelForCell(cell);
 
-    // Do not gate visibility with the legacy preference yet; X 12.16 video
-    // detection is now the source of truth for whether this control is shown.
     if (!viewModel) {
         [button removeFromSuperview];
         return;
@@ -180,7 +191,7 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     }
 
     const CGFloat size = 30.0;
-    const CGFloat rightInset = 40.0;
+    const CGFloat rightInset = 28.0;
     const CGFloat bottomInset = 12.0;
     CGFloat width = CGRectGetWidth(host.bounds);
     CGFloat height = CGRectGetHeight(host.bounds);
@@ -261,7 +272,7 @@ static void BHTInstallVideoTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed delayed video download button with downloader bridge");
+    NSLog(@"[BHTwitter][X12.16] Installed video download button with delegate proxy");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
