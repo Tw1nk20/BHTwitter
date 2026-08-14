@@ -131,15 +131,17 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
         NSLog(@"[BHTwitter][X12.16] Added direct profile-header copy button");
     }
 
-    // Place it directly on the profile header, to the left of the existing
-    // top-right profile action cluster. This avoids actionButtonsView internals.
+    // FLEX showed T1ProfileHeaderView is ~288pt tall and T1ProfileSummaryView
+    // starts around y=118. Move the button down into the actually tappable
+    // action region instead of placing it under the cover/navigation overlay.
     CGFloat size = 34.0;
     CGFloat rightInset = 58.0;
-    CGFloat topInset = 12.0;
+    CGFloat topInset = 58.0;
     button.frame = CGRectMake(MAX(8.0, CGRectGetWidth(headerView.bounds) - rightInset - size),
                               topInset,
                               size,
                               size);
+    button.userInteractionEnabled = YES;
     [headerView bringSubviewToFront:button];
 }
 
