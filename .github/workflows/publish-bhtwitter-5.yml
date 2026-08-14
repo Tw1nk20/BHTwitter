@@ -1,0 +1,104 @@
+name: Publish BHTwitter 5.0
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '.github/workflows/publish-bhtwitter-5.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish BHTwitter 5.0 for X 12.16
+    runs-on: macos-15
+    env:
+      ARTIFACT_ID: '9217321529'
+      RELEASE_TAG: 'v5.0'
+      RELEASE_NAME: 'BHTwitter 5.0 - X 12.16'
+      RELEASE_FILE: 'BHTwitter-sideloaded_5.0_12.16.ipa'
+
+    steps:
+      - name: Download verified X 12.16 build artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -o artifact.zip
+          mkdir artifact
+          unzip -q artifact.zip -d artifact
+          find artifact -maxdepth 3 -type f -print
+
+      - name: Prepare BHTwitter 5.0 IPA
+        run: |
+          set -euo pipefail
+          IPA_PATH="$(find artifact -type f -name '*.ipa' | head -n 1)"
+          if [ -z "${IPA_PATH}" ]; then
+            echo "No IPA found in artifact"
+            exit 1
+          fi
+
+          mkdir patched
+          unzip -q "${IPA_PATH}" -d patched
+
+          APP_DIR="$(find patched/Payload -maxdepth 1 -type d -name '*.app' | head -n 1)"
+          if [ -z "${APP_DIR}" ]; then
+            echo "X app bundle not found"
+            exit 1
+          fi
+
+          X_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_DIR}/Info.plist")
+          echo "Detected X version: ${X_VERSION}"
+          if [ "${X_VERSION}" != "12.16" ]; then
+            echo "Expected X 12.16 but artifact contains ${X_VERSION}"
+            exit 1
+          fi
+
+          BHT_INFO="$(find "${APP_DIR}" -type f -path '*BHTwitter.bundle/Info.plist' | head -n 1)"
+          if [ -z "${BHT_INFO}" ]; then
+            echo "BHTwitter.bundle/Info.plist not found"
+            exit 1
+          fi
+
+          if /usr/libexec/PlistBuddy -c 'Print :BHTVersion' "${BHT_INFO}" >/dev/null 2>&1; then
+            /usr/libexec/PlistBuddy -c 'Set :BHTVersion 5.0' "${BHT_INFO}"
+          else
+            /usr/libexec/PlistBuddy -c 'Add :BHTVersion string 5.0' "${BHT_INFO}"
+          fi
+
+          echo "BHTwitter version: $(/usr/libexec/PlistBuddy -c 'Print :BHTVersion' "${BHT_INFO}")"
+
+          rm -f "${RELEASE_FILE}"
+          (cd patched && zip -qry "../${RELEASE_FILE}" .)
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          EXISTING_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate --jq '.[] | select(.tag_name == "v5.0") | .id' | head -n 1 || true)"
+          if [ -n "${EXISTING_ID}" ]; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${EXISTING_ID}"
+          fi
+
+          if git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}" | grep -q .; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG#v}" || true
+          fi
+
+          gh release create "${RELEASE_TAG}" "${RELEASE_FILE}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "master" \
+            --title "${RELEASE_NAME}" \
+            --notes $'## BHTwitter 5.0\n\n**Supported X version: 12.16**\n\nOfficial BHTwitter 5.0 release targeting X 12.16. Includes the X 12.16 compatibility updates and profile UI compatibility work.'
+
+          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}"
