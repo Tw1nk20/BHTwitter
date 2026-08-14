@@ -109,18 +109,13 @@ static UIButton *BHTEnsureCopyButton(UIView *headerView) {
 
     button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = BHTProfileCopyButtonTag;
-
-    // Match X 12.16's native profile action icons: no circular background,
-    // secondary gray tint and a compact symbol size.
     button.backgroundColor = UIColor.clearColor;
-    button.layer.cornerRadius = 0.0;
-    button.layer.borderWidth = 0.0;
-    button.layer.borderColor = UIColor.clearColor.CGColor;
-    button.tintColor = UIColor.secondaryLabelColor;
+    button.tintColor = [UIColor colorWithWhite:1.0 alpha:0.96];
     button.adjustsImageWhenHighlighted = YES;
+    button.accessibilityLabel = @"プロフィール情報をコピー";
 
     UIImageSymbolConfiguration *symbolConfig =
-        [UIImageSymbolConfiguration configurationWithPointSize:23.0
+        [UIImageSymbolConfiguration configurationWithPointSize:22.0
                                                         weight:UIImageSymbolWeightRegular
                                                          scale:UIImageSymbolScaleMedium];
     UIImage *copyImage = [[UIImage systemImageNamed:@"doc.on.doc"] imageByApplyingSymbolConfiguration:symbolConfig];
@@ -128,7 +123,6 @@ static UIButton *BHTEnsureCopyButton(UIView *headerView) {
     button.imageView.contentMode = UIViewContentModeScaleAspectFit;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
     button.contentVerticalAlignment = UIControlContentVerticalAlignmentCenter;
-    button.accessibilityLabel = @"プロフィール情報をコピー";
 
     [button addTarget:[BHTProfileCopyTarget sharedTarget]
                action:@selector(bht_profileCopyTapped:)
@@ -137,12 +131,8 @@ static UIButton *BHTEnsureCopyButton(UIView *headerView) {
     return button;
 }
 
-// Find the small action controls in the lower part of the profile header.
-// Instead of depending on a private X class name or a "share" accessibility
-// label, use the real button row that is already visible. The copy button is
-// placed immediately to the left of the left-most small control in that row.
-static UIView *BHTFindLeftmostProfileActionControl(UIView *root) {
-    if (!root || CGRectGetWidth(root.bounds) <= 0.0 || CGRectGetHeight(root.bounds) <= 0.0) return nil;
+static NSArray<NSDictionary *> *BHTProfileActionCandidates(UIView *root) {
+    if (!root || CGRectGetWidth(root.bounds) <= 0.0 || CGRectGetHeight(root.bounds) <= 0.0) return @[];
 
     NSMutableArray<NSDictionary *> *candidates = [NSMutableArray array];
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
@@ -152,12 +142,7 @@ static UIView *BHTFindLeftmostProfileActionControl(UIView *root) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
 
-        if (view != root &&
-            view.tag != BHTProfileCopyButtonTag &&
-            !view.hidden &&
-            view.alpha > 0.05 &&
-            view.superview) {
-
+        if (view != root && view.tag != BHTProfileCopyButtonTag && !view.hidden && view.alpha > 0.05 && view.superview) {
             BOOL isControl = [view isKindOfClass:[UIControl class]];
             NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
             BOOL looksLikeButton = isControl || [className containsString:@"button"] || [className containsString:@"control"];
@@ -167,20 +152,21 @@ static UIView *BHTFindLeftmostProfileActionControl(UIView *root) {
                 CGFloat width = CGRectGetWidth(frame);
                 CGFloat height = CGRectGetHeight(frame);
                 CGFloat midY = CGRectGetMidY(frame);
-
-                BOOL smallActionSize = width >= 24.0 && width <= 64.0 && height >= 24.0 && height <= 64.0;
-                BOOL lowerHeader = midY >= MAX(105.0, rootHeight * 0.42) && midY <= rootHeight - 4.0;
-
-                if (smallActionSize && lowerHeader) {
-                    [candidates addObject:@{ @"view": view,
-                                             @"frame": [NSValue valueWithCGRect:frame] }];
+                BOOL actionSize = width >= 30.0 && width <= 72.0 && height >= 30.0 && height <= 72.0;
+                BOOL lowerHeader = midY >= MAX(105.0, rootHeight * 0.40) && midY <= rootHeight - 4.0;
+                if (actionSize && lowerHeader) {
+                    [candidates addObject:@{ @"view": view, @"frame": [NSValue valueWithCGRect:frame] }];
                 }
             }
         }
-
         [stack addObjectsFromArray:view.subviews];
     }
 
+    return candidates;
+}
+
+static UIView *BHTFindRightmostProfileActionControl(UIView *root) {
+    NSArray<NSDictionary *> *candidates = BHTProfileActionCandidates(root);
     if (candidates.count == 0) return nil;
 
     CGFloat lowestMidY = -CGFLOAT_MAX;
@@ -190,17 +176,40 @@ static UIView *BHTFindLeftmostProfileActionControl(UIView *root) {
     }
 
     UIView *best = nil;
-    CGFloat bestX = CGFLOAT_MAX;
+    CGFloat bestX = -CGFLOAT_MAX;
     for (NSDictionary *candidate in candidates) {
         CGRect frame = [candidate[@"frame"] CGRectValue];
-        if (fabs(CGRectGetMidY(frame) - lowestMidY) > 24.0) continue;
-        if (CGRectGetMinX(frame) < bestX) {
-            bestX = CGRectGetMinX(frame);
+        if (fabs(CGRectGetMidY(frame) - lowestMidY) > 26.0) continue;
+        if (CGRectGetMaxX(frame) > bestX) {
+            bestX = CGRectGetMaxX(frame);
             best = candidate[@"view"];
         }
     }
-
     return best;
+}
+
+static void BHTStyleCopyButtonLikeAnchor(UIButton *button, UIView *anchor) {
+    if (!button) return;
+
+    CGFloat diameter = 48.0;
+    CGFloat borderWidth = 1.0 / UIScreen.mainScreen.scale;
+    UIColor *borderColor = [UIColor colorWithWhite:1.0 alpha:0.18];
+
+    if (anchor) {
+        CGFloat anchorSize = MIN(CGRectGetWidth(anchor.bounds), CGRectGetHeight(anchor.bounds));
+        if (anchorSize >= 40.0 && anchorSize <= 68.0) diameter = anchorSize;
+        if (anchor.layer.cornerRadius > 0.0) {
+            borderWidth = MAX(anchor.layer.borderWidth, 1.0 / UIScreen.mainScreen.scale);
+            if (anchor.layer.borderColor) borderColor = [UIColor colorWithCGColor:anchor.layer.borderColor];
+        }
+    }
+
+    button.bounds = CGRectMake(0.0, 0.0, diameter, diameter);
+    button.layer.cornerRadius = diameter * 0.5;
+    button.layer.masksToBounds = YES;
+    button.layer.borderWidth = borderWidth;
+    button.layer.borderColor = borderColor.CGColor;
+    button.tintColor = [UIColor colorWithWhite:1.0 alpha:0.98];
 }
 
 static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
@@ -219,7 +228,6 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
 
     CGFloat headerWidth = CGRectGetWidth(headerView.bounds);
     CGFloat headerHeight = CGRectGetHeight(headerView.bounds);
-
     if (headerWidth < 100.0 || headerHeight < 125.0) {
         [button removeFromSuperview];
         return;
@@ -228,29 +236,28 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
     if (!button) button = BHTEnsureCopyButton(headerView);
     if (!button) return;
 
-    // X's native action icons visually occupy about 24pt inside a roughly
-    // 32pt hit target. Keep our hit area comfortable while matching appearance.
-    const CGFloat hitSize = 32.0;
+    UIView *anchor = BHTFindRightmostProfileActionControl(headerView);
+    BHTStyleCopyButtonLikeAnchor(button, anchor);
+
+    CGFloat diameter = CGRectGetWidth(button.bounds);
     const CGFloat gap = 10.0;
-    UIView *anchor = BHTFindLeftmostProfileActionControl(headerView);
     CGRect targetFrame = CGRectZero;
 
     if (anchor && anchor.superview) {
         CGRect anchorFrame = [anchor.superview convertRect:anchor.frame toView:headerView];
-        targetFrame = CGRectMake(CGRectGetMinX(anchorFrame) - gap - hitSize,
-                                 CGRectGetMidY(anchorFrame) - hitSize * 0.5,
-                                 hitSize,
-                                 hitSize);
+        targetFrame = CGRectMake(CGRectGetMinX(anchorFrame) - gap - diameter,
+                                 CGRectGetMidY(anchorFrame) - diameter * 0.5,
+                                 diameter,
+                                 diameter);
     } else {
-        // Conservative fallback aligned with the native lower action row.
-        targetFrame = CGRectMake(MAX(8.0, headerWidth - 180.0),
-                                 MAX(8.0, headerHeight - 50.0),
-                                 hitSize,
-                                 hitSize);
+        targetFrame = CGRectMake(MAX(8.0, headerWidth - 126.0),
+                                 MAX(8.0, headerHeight - diameter - 14.0),
+                                 diameter,
+                                 diameter);
     }
 
-    targetFrame.origin.x = MAX(8.0, MIN(targetFrame.origin.x, MAX(8.0, headerWidth - hitSize - 8.0)));
-    targetFrame.origin.y = MAX(8.0, MIN(targetFrame.origin.y, MAX(8.0, headerHeight - hitSize - 8.0)));
+    targetFrame.origin.x = MAX(8.0, MIN(targetFrame.origin.x, MAX(8.0, headerWidth - diameter - 8.0)));
+    targetFrame.origin.y = MAX(8.0, MIN(targetFrame.origin.y, MAX(8.0, headerHeight - diameter - 8.0)));
 
     button.frame = CGRectIntegral(targetFrame);
     button.hidden = NO;
