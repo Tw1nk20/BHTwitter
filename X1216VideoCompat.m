@@ -33,14 +33,43 @@ static BOOL BHTRuntimeItemIsVideo(id item) {
                 SEL mediaTypeSEL = NSSelectorFromString(@"mediaType");
                 if ([media respondsToSelector:mediaTypeSEL]) {
                     NSInteger mediaType = ((NSInteger (*)(id, SEL))objc_msgSend)(media, mediaTypeSEL);
-                    // BHTwitter's current model mapping: 2 = GIF, 3 = video.
                     if (mediaType == 2 || mediaType == 3) return YES;
                 }
 
-                NSString *desc = [[media description] lowercaseString];
-                if ([desc containsString:@"mediatype: video"] ||
-                    [desc containsString:@"mediatype: gif"]) {
-                    return YES;
+                SEL videoInfoSEL = NSSelectorFromString(@"videoInfo");
+                if ([media respondsToSelector:videoInfoSEL]) {
+                    id videoInfo = ((id (*)(id, SEL))objc_msgSend)(media, videoInfoSEL);
+                    if (videoInfo) return YES;
+                }
+            }
+        }
+    }
+
+    // Fallback for wrappers that expose the underlying tweet/status object.
+    SEL tweetSEL = NSSelectorFromString(@"tweet");
+    if ([item respondsToSelector:tweetSEL]) {
+        id tweet = ((id (*)(id, SEL))objc_msgSend)(item, tweetSEL);
+        if (tweet && tweet != item && BHTRuntimeItemIsVideo(tweet)) return YES;
+    }
+
+    SEL entitiesSEL = NSSelectorFromString(@"entities");
+    if ([item respondsToSelector:entitiesSEL]) {
+        id entitySet = ((id (*)(id, SEL))objc_msgSend)(item, entitiesSEL);
+        SEL mediaSEL = NSSelectorFromString(@"media");
+        if ([entitySet respondsToSelector:mediaSEL]) {
+            id mediaArray = ((id (*)(id, SEL))objc_msgSend)(entitySet, mediaSEL);
+            if ([mediaArray isKindOfClass:[NSArray class]]) {
+                for (id media in (NSArray *)mediaArray) {
+                    SEL mediaTypeSEL = NSSelectorFromString(@"mediaType");
+                    if ([media respondsToSelector:mediaTypeSEL]) {
+                        NSInteger mediaType = ((NSInteger (*)(id, SEL))objc_msgSend)(media, mediaTypeSEL);
+                        if (mediaType == 2 || mediaType == 3) return YES;
+                    }
+                    SEL videoInfoSEL = NSSelectorFromString(@"videoInfo");
+                    if ([media respondsToSelector:videoInfoSEL] &&
+                        ((id (*)(id, SEL))objc_msgSend)(media, videoInfoSEL)) {
+                        return YES;
+                    }
                 }
             }
         }
@@ -84,7 +113,6 @@ static UIView *BHTFindActionsView(UIView *root) {
 }
 
 - (void)bht_downloadVideoTapped:(UIButton *)sender {
-    UIView *host = sender.superview;
     UITableViewCell *cell = nil;
     UIResponder *responder = sender;
 
@@ -96,7 +124,7 @@ static UIView *BHTFindActionsView(UIView *root) {
         responder = responder.nextResponder;
     }
 
-    UIView *searchRoot = cell ?: host;
+    UIView *searchRoot = cell ?: sender.superview;
     UIView *actionsView = BHTFindActionsView(searchRoot);
     id viewModel = nil;
 
@@ -105,15 +133,12 @@ static UIView *BHTFindActionsView(UIView *root) {
         viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
     }
 
-    if (!viewModel) {
+    if (!viewModel || !BHTRuntimeItemIsVideo(viewModel)) {
         viewModel = objc_getAssociatedObject(sender, BHTVideoItemKey);
     }
 
     if (!viewModel || !BHTRuntimeItemIsVideo(viewModel)) return;
 
-    // BHDownloadInlineButton already contains BHTwitter's quality-selection,
-    // MP4/M3U8 handling and direct-save logic. Reuse it instead of duplicating
-    // the downloader here.
     BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
     downloadButton.delegate = (id)actionsView;
     downloadButton.viewModel = viewModel;
@@ -122,17 +147,15 @@ static UIView *BHTFindActionsView(UIView *root) {
 
 @end
 
-static void BHTConfigureDownloadButton(UITableViewCell *cell, id item) {
+static void BHTConfigureDownloadButton(UITableViewCell *cell, id timelineItem) {
     if (!cell) return;
 
     UIView *host = cell.contentView ?: cell;
     UIButton *button = (UIButton *)[host viewWithTag:BHTVideoDownloadButtonTag];
 
-    BOOL shouldShow = [BHTManager DownloadingVideos] && BHTRuntimeItemIsVideo(item);
+    BOOL shouldShow = [BHTManager DownloadingVideos] && BHTRuntimeItemIsVideo(timelineItem);
     if (!shouldShow) {
-        if (button) {
-            [button removeFromSuperview];
-        }
+        [button removeFromSuperview];
         return;
     }
 
@@ -144,7 +167,7 @@ static void BHTConfigureDownloadButton(UITableViewCell *cell, id item) {
         button.accessibilityLabel = @"動画をダウンロード";
 
         UIImageSymbolConfiguration *config =
-            [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightRegular];
+            [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightRegular];
         UIImage *image = [UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:config];
         if (!image) image = [UIImage systemImageNamed:@"arrow.down" withConfiguration:config];
         [button setImage:image forState:UIControlStateNormal];
@@ -156,12 +179,10 @@ static void BHTConfigureDownloadButton(UITableViewCell *cell, id item) {
         [host addSubview:button];
     }
 
-    objc_setAssociatedObject(button, BHTVideoItemKey, item, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(button, BHTVideoItemKey, timelineItem, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-    // Previous diagnostic placement: size 36, right inset 18.
-    // Final placement: one size smaller and roughly 10pt farther left.
     const CGFloat size = 30.0;
-    const CGFloat rightInset = 34.0;
+    const CGFloat rightInset = 44.0;
     const CGFloat bottomInset = 12.0;
     CGFloat width = CGRectGetWidth(host.bounds);
     CGFloat height = CGRectGetHeight(host.bounds);
@@ -183,7 +204,17 @@ static UITableViewCell *BHTVideoTableCellForItem(id self, SEL _cmd, id item, id 
         cell = ((BHTTableCellForItemIMP)BHTOriginalTableCellForItemIMP)(self, _cmd, item, indexPath);
     }
 
-    BHTConfigureDownloadButton(cell, item);
+    // Important: the first argument to tableViewCellForItem:atIndexPath: is not
+    // necessarily the T1URTTimelineStatusItemViewModel. BHTwitter's own existing
+    // hook resolves the real timeline item with itemAtIndexPath:, so do the same.
+    id timelineItem = item;
+    SEL itemAtIndexPathSEL = NSSelectorFromString(@"itemAtIndexPath:");
+    if ([self respondsToSelector:itemAtIndexPathSEL] && indexPath) {
+        id resolved = ((id (*)(id, SEL, id))objc_msgSend)(self, itemAtIndexPathSEL, indexPath);
+        if (resolved) timelineItem = resolved;
+    }
+
+    BHTConfigureDownloadButton(cell, timelineItem);
     return cell;
 }
 
@@ -216,7 +247,7 @@ static void BHTInstallVideoTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed video-only timeline download button");
+    NSLog(@"[BHTwitter][X12.16] Installed video-only timeline download button (resolved item model)");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
