@@ -36,18 +36,28 @@ static UIView *BHTFindProfileShareControlInView(UIView *root) {
     if (!root) return nil;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     UIView *best = nil;
-    CGFloat bestMidY = -CGFLOAT_MAX;
+    CGFloat bestScore = -CGFLOAT_MAX;
+    const CGFloat minMidY = 120.0;
+
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
-        if (view != root && view.tag != BHTProfileCopyButtonTag && !view.hidden && view.alpha > 0.01) {
+        if (view != root && view.tag != BHTProfileCopyButtonTag && !view.hidden && view.alpha > 0.01 && view.superview) {
             NSString *label = view.accessibilityLabel.lowercaseString ?: @"";
             NSString *identifier = view.accessibilityIdentifier.lowercaseString ?: @"";
             BOOL looksLikeShare = [label containsString:@"共有"] || [label containsString:@"share"] || [identifier containsString:@"share"];
-            if (looksLikeShare && view.superview) {
+            if (looksLikeShare) {
                 CGRect frameInHeader = [view.superview convertRect:view.frame toView:root];
+                CGFloat midX = CGRectGetMidX(frameInHeader);
                 CGFloat midY = CGRectGetMidY(frameInHeader);
-                if (midY > bestMidY) { bestMidY = midY; best = view; }
+                CGFloat w = CGRectGetWidth(frameInHeader);
+                CGFloat h = CGRectGetHeight(frameInHeader);
+                BOOL sizeOK = (w >= 24.0 && w <= 64.0 && h >= 24.0 && h <= 64.0);
+                BOOL positionOK = (midY >= minMidY && midX >= CGRectGetWidth(root.bounds) * 0.55);
+                if (sizeOK && positionOK) {
+                    CGFloat score = midY * 2.0 + midX;
+                    if (score > bestScore) { bestScore = score; best = view; }
+                }
             }
         }
         [stack addObjectsFromArray:view.subviews];
@@ -103,8 +113,8 @@ static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, U
 }
 @end
 
-static UIButton *BHTEnsureCopyButton(UIView *headerView) {
-    UIButton *button = (UIButton *)[headerView viewWithTag:BHTProfileCopyButtonTag];
+static UIButton *BHTEnsureCopyButton(UIView *container) {
+    UIButton *button = (UIButton *)[container viewWithTag:BHTProfileCopyButtonTag];
     if (button) return button;
     button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = BHTProfileCopyButtonTag;
@@ -116,49 +126,61 @@ static UIButton *BHTEnsureCopyButton(UIView *headerView) {
     [button setImage:[UIImage systemImageNamed:@"doc.on.clipboard"] forState:UIControlStateNormal];
     button.accessibilityLabel = @"プロフィール情報をコピー";
     [button addTarget:[BHTProfileCopyTarget sharedTarget] action:@selector(bht_profileCopyTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [headerView addSubview:button];
+    [container addSubview:button];
     return button;
+}
+
+static UIButton *BHTFindProfileCopyButtonInViewTree(UIView *root) {
+    if (!root) return nil;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if (view.tag == BHTProfileCopyButtonTag && [view isKindOfClass:[UIButton class]]) return (UIButton *)view;
+        [stack addObjectsFromArray:view.subviews];
+    }
+    return nil;
 }
 
 static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
     if (BHTOriginalProfileHeaderLayoutIMP) ((BHTLayoutIMP)BHTOriginalProfileHeaderLayoutIMP)(self, _cmd);
     if (![self isKindOfClass:[UIView class]]) return;
     UIView *headerView = (UIView *)self;
-    UIButton *existing = (UIButton *)[headerView viewWithTag:BHTProfileCopyButtonTag];
+    UIButton *button = BHTFindProfileCopyButtonInViewTree(headerView);
+
     if (!BHTX1216CopyProfileInfoEnabled()) {
-        [existing removeFromSuperview];
+        [button removeFromSuperview];
         return;
     }
-    UIButton *button = BHTEnsureCopyButton(headerView);
+
+    UIView *shareControl = BHTFindProfileShareControlInView(headerView);
+    if (!shareControl || !shareControl.superview) {
+        [button removeFromSuperview];
+        return;
+    }
+
+    UIView *container = shareControl.superview;
+    if (button && button.superview != container) {
+        [button removeFromSuperview];
+        button = nil;
+    }
+    if (!button) button = BHTEnsureCopyButton(container);
     if (!button) return;
 
     const CGFloat size = 36.0;
     const CGFloat gap = 8.0;
-    const CGFloat xOffset = 14.0;
-    const CGFloat yOffset = 90.0;
-    UIView *shareControl = BHTFindProfileShareControlInView(headerView);
-    CGRect targetFrame = CGRectZero;
-
-    if (shareControl && shareControl != button && shareControl.superview) {
-        CGRect shareFrame = [shareControl.superview convertRect:shareControl.frame toView:headerView];
-        targetFrame = CGRectMake(CGRectGetMinX(shareFrame) - gap - size + xOffset,
-                                 CGRectGetMidY(shareFrame) - size * 0.5 + yOffset,
-                                 size,
-                                 size);
-    } else {
-        targetFrame = CGRectMake(MAX(8.0, CGRectGetWidth(headerView.bounds) - 78.0 - size),
-                                 MAX(4.0, CGRectGetHeight(headerView.bounds) * 0.52),
-                                 size,
-                                 size);
-    }
-
-    targetFrame.origin.x = MAX(4.0, MIN(targetFrame.origin.x, MAX(4.0, CGRectGetWidth(headerView.bounds) - size - 4.0)));
-    targetFrame.origin.y = MAX(4.0, MIN(targetFrame.origin.y, MAX(4.0, CGRectGetHeight(headerView.bounds) - size - 4.0)));
+    CGRect shareFrame = shareControl.frame;
+    CGRect targetFrame = CGRectMake(CGRectGetMinX(shareFrame) - gap - size,
+                                    CGRectGetMidY(shareFrame) - size * 0.5,
+                                    size,
+                                    size);
+    targetFrame.origin.x = MAX(0.0, MIN(targetFrame.origin.x, MAX(0.0, CGRectGetWidth(container.bounds) - size)));
+    targetFrame.origin.y = MAX(0.0, MIN(targetFrame.origin.y, MAX(0.0, CGRectGetHeight(container.bounds) - size)));
     button.frame = CGRectIntegral(targetFrame);
     button.hidden = NO;
     button.alpha = 1.0;
     button.userInteractionEnabled = YES;
-    [headerView bringSubviewToFront:button];
+    [container bringSubviewToFront:button];
 }
 
 static void BHTInstallX1216ProfileCompat(void) {
