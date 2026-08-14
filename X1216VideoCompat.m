@@ -3,7 +3,7 @@
 #import <objc/message.h>
 
 // Diagnostic build: prove that our X 12.16 compatibility code can add UI to
-// ordinary timeline cells before spending more time on video/share detection.
+// ordinary timeline cells and place it in the post action area.
 static const NSInteger BHTDiagnosticArrowTag = 1216099;
 static IMP BHTOriginalTableCellForItemIMP = NULL;
 
@@ -43,11 +43,9 @@ static void BHTAddDiagnosticArrowToCell(UITableViewCell *cell) {
     if (!button) {
         button = [UIButton buttonWithType:UIButtonTypeSystem];
         button.tag = BHTDiagnosticArrowTag;
-        button.frame = CGRectMake(8.0, 8.0, 42.0, 42.0);
-        button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
         button.backgroundColor = UIColor.systemRedColor;
         button.tintColor = UIColor.whiteColor;
-        button.layer.cornerRadius = 21.0;
+        button.layer.cornerRadius = 18.0;
         button.layer.borderWidth = 2.0;
         button.layer.borderColor = UIColor.whiteColor.CGColor;
         button.accessibilityLabel = @"BHTwitter テスト矢印";
@@ -62,6 +60,20 @@ static void BHTAddDiagnosticArrowToCell(UITableViewCell *cell) {
         NSLog(@"[BHTwitter][X12.16][TEST] Added diagnostic arrow to %@", NSStringFromClass([cell class]));
     }
 
+    // Put the diagnostic button in the lower-right part of the post, near the
+    // native reply/repost/like/bookmark/share action row. Recompute every time
+    // because timeline cells have different heights depending on their media.
+    const CGFloat size = 36.0;
+    const CGFloat rightInset = 18.0;
+    const CGFloat bottomInset = 10.0;
+    CGFloat width = CGRectGetWidth(host.bounds);
+    CGFloat height = CGRectGetHeight(host.bounds);
+
+    CGFloat x = MAX(8.0, width - rightInset - size);
+    CGFloat y = MAX(8.0, height - bottomInset - size);
+    button.frame = CGRectIntegral(CGRectMake(x, y, size, size));
+    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+
     button.hidden = NO;
     button.alpha = 1.0;
     button.userInteractionEnabled = YES;
@@ -75,7 +87,7 @@ static UITableViewCell *BHTDiagnosticTableCellForItem(id self, SEL _cmd, id item
     }
 
     // Intentionally unconditional for this diagnostic build. If this arrow is
-    // visible, the compatibility dylib and timeline-cell hook are both working.
+    // visible, the compatibility code and timeline-cell hook are both working.
     BHTAddDiagnosticArrowToCell(cell);
     return cell;
 }
@@ -98,9 +110,6 @@ static void BHTInstallDiagnosticTimelineHook(void) {
     const char *types = method_getTypeEncoding(method);
     BHTOriginalTableCellForItemIMP = current;
 
-    // Add a class-local override if the method is inherited; otherwise replace
-    // only TFNItemsDataViewController's own implementation. The captured IMP
-    // already includes BHTwitter's existing Logos hook, so normal behavior is kept.
     unsigned int count = 0;
     Method *methods = class_copyMethodList(cls, &count);
     Method ownMethod = NULL;
@@ -119,7 +128,7 @@ static void BHTInstallDiagnosticTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTDiagnosticTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16][TEST] Installed unconditional timeline arrow diagnostic");
+    NSLog(@"[BHTwitter][X12.16][TEST] Installed bottom-action-area arrow diagnostic");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
