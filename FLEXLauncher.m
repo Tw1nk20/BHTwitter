@@ -6,6 +6,7 @@ static void BHTTryShowFLEX(NSUInteger attempt) {
         Class flexManagerClass = NSClassFromString(@"FLEXManager");
         SEL sharedManagerSelector = NSSelectorFromString(@"sharedManager");
         SEL showExplorerSelector = NSSelectorFromString(@"showExplorer");
+        BOOL didShow = NO;
 
         if (flexManagerClass && [flexManagerClass respondsToSelector:sharedManagerSelector]) {
 #pragma clang diagnostic push
@@ -14,11 +15,12 @@ static void BHTTryShowFLEX(NSUInteger attempt) {
             if (manager && [manager respondsToSelector:showExplorerSelector]) {
                 NSLog(@"[BHTwitter][FLEX] FLEXManager found; showing explorer");
                 [manager performSelector:showExplorerSelector];
-#pragma clang diagnostic pop
-                return;
+                didShow = YES;
             }
 #pragma clang diagnostic pop
         }
+
+        if (didShow) return;
 
         if (attempt < 10) {
             NSLog(@"[BHTwitter][FLEX] FLEXManager not ready (attempt %lu)", (unsigned long)attempt);
