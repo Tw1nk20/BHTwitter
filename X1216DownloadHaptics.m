@@ -4,10 +4,18 @@
 static IMP BHTOriginalDownloadDidFinishIMP = NULL;
 typedef void (*BHTDownloadDidFinishIMP)(id, SEL, NSURL *, NSString *);
 
-static void BHTDownloadCompletionImpact(void) {
-    UIImpactFeedbackGenerator *generator = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [generator prepare];
-    [generator impactOccurred];
+static void BHTDownloadCompletionDoubleImpact(void) {
+    UIImpactFeedbackGenerator *first = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [first prepare];
+    [first impactOccurred];
+
+    // A short second impact creates the requested "トトンッ" completion cue.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIImpactFeedbackGenerator *second = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [second prepare];
+        [second impactOccurred];
+    });
 }
 
 static void BHTDownloadDidFinishWithHaptic(id self, SEL _cmd, NSURL *tmpURL, NSString *name) {
@@ -15,9 +23,9 @@ static void BHTDownloadDidFinishWithHaptic(id self, SEL _cmd, NSURL *tmpURL, NSS
         ((BHTDownloadDidFinishIMP)BHTOriginalDownloadDidFinishIMP)(self, _cmd, tmpURL, name);
     }
 
-    // Fire only after BHTwitter's original completion path has run.
+    // Fire only after BHTwitter's original completion/save path has run.
     dispatch_async(dispatch_get_main_queue(), ^{
-        BHTDownloadCompletionImpact();
+        BHTDownloadCompletionDoubleImpact();
     });
 }
 
@@ -30,6 +38,6 @@ __attribute__((constructor)) static void BHTX1216DownloadHapticsInit(void) {
 
         BHTOriginalDownloadDidFinishIMP = method_getImplementation(method);
         method_setImplementation(method, (IMP)BHTDownloadDidFinishWithHaptic);
-        NSLog(@"[BHTwitter][X12.16] Installed download-completion haptic");
+        NSLog(@"[BHTwitter][X12.16] Installed double download-completion haptic");
     });
 }
