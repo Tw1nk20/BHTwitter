@@ -8,6 +8,30 @@ static const NSInteger BHTProfileCopyButtonTag = 1216001;
 static IMP BHTOriginalProfileHeaderLayoutIMP = NULL;
 typedef void (*BHTLayoutIMP)(id, SEL);
 
+// Disable only the legacy Tweak.x gate on X 12.16. The actual preference is
+// still read directly from NSUserDefaults below so the compatibility button
+// remains enabled when the user has CopyProfileInfo turned on.
+static BOOL BHTLegacyCopyProfileInfoDisabled(id self, SEL _cmd) {
+    return NO;
+}
+
+static BOOL BHTX1216CopyProfileInfoEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"CopyProfileInfo"];
+}
+
+static void BHTDisableLegacyProfileCopyHook(void) {
+    Class managerClass = NSClassFromString(@"BHTManager");
+    SEL selector = NSSelectorFromString(@"CopyProfileInfo");
+    Method method = managerClass ? class_getClassMethod(managerClass, selector) : NULL;
+    if (!method) return;
+
+    Class metaClass = object_getClass(managerClass);
+    class_replaceMethod(metaClass,
+                        selector,
+                        (IMP)BHTLegacyCopyProfileInfoDisabled,
+                        method_getTypeEncoding(method));
+}
+
 static UIViewController *BHTProfileHeaderControllerFromView(UIView *view) {
     UIResponder *responder = view;
     while (responder) {
@@ -150,7 +174,6 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
     }
 
     if (![self isKindOfClass:[UIView class]]) return;
-    UIView *headerView = (UIView *)self;
 
     id actionButtonsView = nil;
     SEL actionButtonsSelector = NSSelectorFromString(@"actionButtonsView");
@@ -162,7 +185,7 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
     UIView *container = (UIView *)actionButtonsView;
 
     UIButton *existing = (UIButton *)[container viewWithTag:BHTProfileCopyButtonTag];
-    if (![BHTManager CopyProfileInfo]) {
+    if (!BHTX1216CopyProfileInfoEnabled()) {
         [existing removeFromSuperview];
         return;
     }
@@ -188,7 +211,6 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
                                  size);
     }
 
-    // Keep the button entirely inside the actionButtonsView's interactive bounds.
     targetFrame.origin.x = MAX(0.0, MIN(targetFrame.origin.x, CGRectGetWidth(container.bounds) - size));
     targetFrame.origin.y = MAX(0.0, MIN(targetFrame.origin.y, CGRectGetHeight(container.bounds) - size));
     button.frame = CGRectIntegral(targetFrame);
@@ -211,14 +233,11 @@ static void BHTInstallX1216ProfileCompat(void) {
     IMP replacement = (IMP)BHTProfileHeaderLayoutSubviews;
     BHTOriginalProfileHeaderLayoutIMP = method_getImplementation(inheritedMethod);
 
-    // First try to add a class-local override. If layoutSubviews is inherited,
-    // this is the safe path and leaves UIView's implementation untouched.
     if (class_addMethod(cls, selector, replacement, types)) {
         NSLog(@"[BHTwitter][X12.16] Added class-local profile layout override");
         return;
     }
 
-    // The class already owns layoutSubviews, so replacing that method is safe.
     Method ownMethod = class_getInstanceMethod(cls, selector);
     if (!ownMethod) return;
 
@@ -228,6 +247,9 @@ static void BHTInstallX1216ProfileCompat(void) {
 }
 
 __attribute__((constructor)) static void BHTX1216ProfileCompatInit(void) {
+    // Stop the legacy Logos hook before any profile can appear.
+    BHTDisableLegacyProfileCopyHook();
+
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         BHTInstallX1216ProfileCompat();
     });
