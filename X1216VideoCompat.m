@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "BHTManager.h"
@@ -147,38 +148,75 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
 
 @end
 
-static NSArray<NSValue *> *BHTNativeActionFramesInsideView(UIView *actionsView) {
-    if (!actionsView) return @[];
+static BOOL BHTViewOrLayerLooksLikeVideo(UIView *view) {
+    if (!view) return NO;
 
-    NSMutableArray<NSValue *> *frames = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:actionsView];
+    NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
+    if ([className containsString:@"video"] ||
+        [className containsString:@"player"] ||
+        [className containsString:@"media"] ||
+        [className containsString:@"slideshow"]) {
+        return YES;
+    }
+
+    NSMutableArray<CALayer *> *layers = [NSMutableArray arrayWithObject:view.layer];
+    while (layers.count) {
+        CALayer *layer = layers.lastObject;
+        [layers removeLastObject];
+        NSString *layerName = NSStringFromClass(layer.class).lowercaseString ?: @"";
+        if ([layerName containsString:@"player"] || [layerName containsString:@"video"]) return YES;
+        [layers addObjectsFromArray:layer.sublayers ?: @[]];
+    }
+
+    return NO;
+}
+
+static UIView *BHTFindMainMediaView(UITableViewCell *cell) {
+    if (!cell) return nil;
+
+    UIView *root = cell.contentView ?: cell;
+    UIView *actionsView = BHTFindActionsView(cell);
+    CGRect actionsFrame = CGRectNull;
+    if (actionsView && actionsView.superview) {
+        actionsFrame = [actionsView.superview convertRect:actionsView.frame toView:root];
+    }
+
+    CGFloat rootWidth = CGRectGetWidth(root.bounds);
+    CGFloat rootHeight = CGRectGetHeight(root.bounds);
+    if (rootWidth <= 0.0 || rootHeight <= 0.0) return nil;
+
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    UIView *best = nil;
+    CGFloat bestScore = -CGFLOAT_MAX;
 
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
 
-        if (view != actionsView &&
+        if (view != root && view != actionsView &&
             view.tag != BHTVideoDownloadButtonTag &&
-            !view.hidden &&
-            view.alpha > 0.05 &&
-            view.superview) {
+            !view.hidden && view.alpha > 0.05 && view.superview) {
 
-            BOOL controlLike = [view isKindOfClass:[UIControl class]];
-            NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
-            controlLike = controlLike || [className containsString:@"button"] || [className containsString:@"control"];
+            CGRect frame = [view.superview convertRect:view.frame toView:root];
+            CGFloat w = CGRectGetWidth(frame);
+            CGFloat h = CGRectGetHeight(frame);
+            CGFloat area = w * h;
 
-            if (controlLike) {
-                CGRect frame = [view.superview convertRect:view.frame toView:actionsView];
-                CGFloat w = CGRectGetWidth(frame);
-                CGFloat h = CGRectGetHeight(frame);
-                CGFloat midY = CGRectGetMidY(frame);
+            BOOL largeEnough = w >= rootWidth * 0.55 && h >= 120.0;
+            BOOL insideCell = CGRectIntersectsRect(root.bounds, frame);
+            BOOL aboveActions = CGRectIsNull(actionsFrame) || CGRectGetMidY(frame) < CGRectGetMidY(actionsFrame);
+            BOOL reasonableHeight = h <= rootHeight * 0.92;
 
-                BOOL sizeOK = w >= 22.0 && w <= 80.0 && h >= 22.0 && h <= 80.0;
-                BOOL inside = CGRectIntersectsRect(CGRectInset(actionsView.bounds, -8.0, -8.0), frame);
-                BOOL verticalOK = midY >= -4.0 && midY <= CGRectGetHeight(actionsView.bounds) + 4.0;
+            if (largeEnough && insideCell && aboveActions && reasonableHeight) {
+                CGFloat score = area;
+                if (BHTViewOrLayerLooksLikeVideo(view)) score += rootWidth * rootHeight * 1.5;
 
-                if (sizeOK && inside && verticalOK) {
-                    [frames addObject:[NSValue valueWithCGRect:frame]];
+                NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
+                if ([className containsString:@"image"] && !BHTViewOrLayerLooksLikeVideo(view)) score -= area * 0.25;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = view;
                 }
             }
         }
@@ -186,123 +224,84 @@ static NSArray<NSValue *> *BHTNativeActionFramesInsideView(UIView *actionsView) 
         [stack addObjectsFromArray:view.subviews];
     }
 
-    [frames sortUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
-        CGFloat ax = CGRectGetMidX(a.CGRectValue);
-        CGFloat bx = CGRectGetMidX(b.CGRectValue);
-        if (ax < bx) return NSOrderedAscending;
-        if (ax > bx) return NSOrderedDescending;
-        return NSOrderedSame;
-    }];
-
-    return frames;
+    return best;
 }
 
-static BOOL BHTFindBookmarkShareGap(UIView *actionsView, CGPoint *centerOut) {
-    NSArray<NSValue *> *frames = BHTNativeActionFramesInsideView(actionsView);
-    if (frames.count < 2) return NO;
+static void BHTRemoveVideoButtonOutsideHost(UITableViewCell *cell, UIView *mediaHost) {
+    if (!cell) return;
 
-    // The two right-most native controls are the stable anchor pair on X 12.16:
-    // bookmark and share. Place the download button exactly halfway between them.
-    CGRect left = frames[frames.count - 2].CGRectValue;
-    CGRect right = frames.lastObject.CGRectValue;
+    UIView *root = cell.contentView ?: cell;
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
 
-    CGFloat leftMidY = CGRectGetMidY(left);
-    CGFloat rightMidY = CGRectGetMidY(right);
-    if (fabs(leftMidY - rightMidY) > 12.0) return NO;
-
-    CGFloat gap = CGRectGetMidX(right) - CGRectGetMidX(left);
-    if (gap < 34.0 || gap > 150.0) return NO;
-
-    if (centerOut) {
-        *centerOut = CGPointMake((CGRectGetMidX(left) + CGRectGetMidX(right)) * 0.5,
-                                 (leftMidY + rightMidY) * 0.5);
+        if (view.tag == BHTVideoDownloadButtonTag && view.superview != mediaHost) {
+            [view removeFromSuperview];
+            continue;
+        }
+        [stack addObjectsFromArray:view.subviews];
     }
-    return YES;
 }
 
-static UIButton *BHTEnsureVideoButton(UIView *actionsView) {
-    if (!actionsView) return nil;
+static UIButton *BHTEnsureVideoButton(UIView *mediaHost) {
+    if (!mediaHost) return nil;
 
-    UIButton *button = (UIButton *)[actionsView viewWithTag:BHTVideoDownloadButtonTag];
+    UIButton *button = (UIButton *)[mediaHost viewWithTag:BHTVideoDownloadButtonTag];
     if (button) return button;
 
     button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = BHTVideoDownloadButtonTag;
-    button.backgroundColor = UIColor.clearColor;
-    button.tintColor = UIColor.secondaryLabelColor;
+    button.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.58];
+    button.tintColor = UIColor.whiteColor;
+    button.layer.cornerRadius = 20.0;
+    button.layer.masksToBounds = YES;
     button.accessibilityLabel = @"動画をダウンロード";
 
     UIImageSymbolConfiguration *config =
-        [UIImageSymbolConfiguration configurationWithPointSize:17.0
-                                                        weight:UIImageSymbolWeightRegular
+        [UIImageSymbolConfiguration configurationWithPointSize:18.0
+                                                        weight:UIImageSymbolWeightSemibold
                                                          scale:UIImageSymbolScaleMedium];
     UIImage *image = [UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:config];
     if (!image) image = [UIImage systemImageNamed:@"arrow.down" withConfiguration:config];
     [button setImage:image forState:UIControlStateNormal];
+    button.imageView.contentMode = UIViewContentModeScaleAspectFit;
 
     [button addTarget:[BHTVideoDownloadTarget sharedTarget]
                action:@selector(bht_downloadVideoTapped:)
      forControlEvents:UIControlEventTouchUpInside];
 
-    [actionsView addSubview:button];
+    [mediaHost addSubview:button];
     return button;
-}
-
-static void BHTRemoveOldVideoButtonFromCell(UITableViewCell *cell, UIView *actionsView) {
-    if (!cell) return;
-
-    UIView *host = cell.contentView ?: cell;
-    UIView *legacyButton = [host viewWithTag:BHTVideoDownloadButtonTag];
-    if (legacyButton && legacyButton.superview != actionsView) {
-        [legacyButton removeFromSuperview];
-    }
 }
 
 static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     if (!cell) return;
 
-    UIView *actionsView = BHTFindActionsView(cell);
     id viewModel = BHTVideoViewModelForCell(cell);
+    UIView *mediaHost = viewModel ? BHTFindMainMediaView(cell) : nil;
 
-    BHTRemoveOldVideoButtonFromCell(cell, actionsView);
-
-    if (!viewModel || !actionsView) {
-        UIView *existing = actionsView ? [actionsView viewWithTag:BHTVideoDownloadButtonTag] : nil;
-        [existing removeFromSuperview];
+    if (!viewModel || !mediaHost) {
+        BHTRemoveVideoButtonOutsideHost(cell, nil);
         return;
     }
 
-    UIButton *button = BHTEnsureVideoButton(actionsView);
+    BHTRemoveVideoButtonOutsideHost(cell, mediaHost);
+
+    UIButton *button = BHTEnsureVideoButton(mediaHost);
     if (!button) return;
 
-    const CGFloat hitSize = 32.0;
-    CGPoint center = CGPointZero;
-
-    if (BHTFindBookmarkShareGap(actionsView, &center)) {
-        button.frame = CGRectIntegral(CGRectMake(center.x - hitSize * 0.5,
-                                                 center.y - hitSize * 0.5,
-                                                 hitSize,
-                                                 hitSize));
-    } else {
-        // Fallback stays inside the native action bar rather than using the cell
-        // bottom. This prevents collisions with detail-only rows such as quotes.
-        CGFloat width = CGRectGetWidth(actionsView.bounds);
-        CGFloat height = CGRectGetHeight(actionsView.bounds);
-        CGFloat centerX = MAX(hitSize * 0.5 + 4.0, width - 70.0);
-        CGFloat centerY = MAX(hitSize * 0.5, height * 0.5);
-        button.frame = CGRectIntegral(CGRectMake(centerX - hitSize * 0.5,
-                                                 centerY - hitSize * 0.5,
-                                                 hitSize,
-                                                 hitSize));
-    }
-
-    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
-                              UIViewAutoresizingFlexibleTopMargin |
-                              UIViewAutoresizingFlexibleBottomMargin;
+    const CGFloat size = 40.0;
+    const CGFloat inset = 10.0;
+    button.frame = CGRectIntegral(CGRectMake(inset, inset, size, size));
+    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
     button.hidden = NO;
     button.alpha = 1.0;
     button.userInteractionEnabled = YES;
-    [actionsView bringSubviewToFront:button];
+
+    // Some media containers clip their children intentionally, which is fine;
+    // the button is fully inside the media bounds and should follow rounded corners.
+    [mediaHost bringSubviewToFront:button];
 }
 
 static void BHTScheduleVideoButtonEvaluation(UITableViewCell *cell) {
@@ -363,7 +362,7 @@ static void BHTInstallVideoTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed video download button anchored to native action bar");
+    NSLog(@"[BHTwitter][X12.16] Installed video download button on media top-left");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
