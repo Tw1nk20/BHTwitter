@@ -10,45 +10,75 @@ on:
 
 permissions:
   contents: write
-  actions: read
 
 jobs:
   publish:
     name: Publish BHTwitter 5.0 for X 12.16
-    runs-on: macos-15
+    runs-on: macos-15-intel
     env:
-      ARTIFACT_ID: '9217321529'
+      SOURCE_RELEASE_ASSET_ID: '514031518'
       RELEASE_TAG: 'v5.0'
       RELEASE_NAME: 'BHTwitter 5.0 - X 12.16'
       RELEASE_FILE: 'BHTwitter-sideloaded_5.0_12.16.ipa'
 
     steps:
-      - name: Download verified X 12.16 build artifact
+      - name: Checkout BHTwitter 5.0 source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: brew install make dpkg ldid
+
+      - name: Add GNU Make to PATH
+        run: echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Download Theos
+        uses: actions/checkout@v4
+        with:
+          repository: theos/theos
+          ref: master
+          path: theos
+          submodules: recursive
+
+      - name: Download iOS 16.5 SDK
+        run: |
+          set -euo pipefail
+          git clone -n --depth=1 --filter=tree:0 https://github.com/theos/sdks/ sdks
+          cd sdks
+          git sparse-checkout set --no-cone iPhoneOS16.5.sdk
+          git checkout
+          mv iPhoneOS16.5.sdk "${THEOS}/sdks/"
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Build current BHTwitter dylib
+        run: |
+          set -euo pipefail
+          sed -i '' 's/^TARGET.*$/TARGET := iphone:clang:16.5:15.0/' Makefile
+          make clean
+          rm -rf .theos
+          make SIDELOADED=1
+          test -f .theos/obj/debug/BHTwitter.dylib
+        env:
+          THEOS: ${{ github.workspace }}/theos
+
+      - name: Download X 12.16 base IPA from previous verified release asset
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           curl -fL \
             -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
+            -H "Accept: application/octet-stream" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ARTIFACT_ID}/zip" \
-            -o artifact.zip
-          mkdir artifact
-          unzip -q artifact.zip -d artifact
-          find artifact -maxdepth 3 -type f -print
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/assets/${SOURCE_RELEASE_ASSET_ID}" \
+            -o base.ipa
+          unzip -q base.ipa -d patched
 
-      - name: Prepare BHTwitter 5.0 IPA
+      - name: Replace tweak with BHTwitter 5.0 build
         run: |
           set -euo pipefail
-          IPA_PATH="$(find artifact -type f -name '*.ipa' | head -n 1)"
-          if [ -z "${IPA_PATH}" ]; then
-            echo "No IPA found in artifact"
-            exit 1
-          fi
-
-          mkdir patched
-          unzip -q "${IPA_PATH}" -d patched
 
           APP_DIR="$(find patched/Payload -maxdepth 1 -type d -name '*.app' | head -n 1)"
           if [ -z "${APP_DIR}" ]; then
@@ -59,16 +89,26 @@ jobs:
           X_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_DIR}/Info.plist")
           echo "Detected X version: ${X_VERSION}"
           if [ "${X_VERSION}" != "12.16" ]; then
-            echo "Expected X 12.16 but artifact contains ${X_VERSION}"
+            echo "Expected X 12.16 but base IPA contains ${X_VERSION}"
             exit 1
           fi
 
-          BHT_INFO="$(find "${APP_DIR}" -type f -path '*BHTwitter.bundle/Info.plist' | head -n 1)"
-          if [ -z "${BHT_INFO}" ]; then
-            echo "BHTwitter.bundle/Info.plist not found"
+          OLD_DYLIB="$(find "${APP_DIR}" -type f -name 'BHTwitter.dylib' | head -n 1)"
+          if [ -z "${OLD_DYLIB}" ]; then
+            echo "Existing BHTwitter.dylib not found in base IPA"
             exit 1
           fi
+          cp .theos/obj/debug/BHTwitter.dylib "${OLD_DYLIB}"
 
+          OLD_BUNDLE="$(find "${APP_DIR}" -type d -name 'BHTwitter.bundle' | head -n 1)"
+          if [ -z "${OLD_BUNDLE}" ]; then
+            echo "Existing BHTwitter.bundle not found in base IPA"
+            exit 1
+          fi
+          rm -rf "${OLD_BUNDLE}"
+          cp -R "layout/Library/Application Support/BHT/BHTwitter.bundle" "${OLD_BUNDLE}"
+
+          BHT_INFO="${OLD_BUNDLE}/Info.plist"
           if /usr/libexec/PlistBuddy -c 'Print :BHTVersion' "${BHT_INFO}" >/dev/null 2>&1; then
             /usr/libexec/PlistBuddy -c 'Set :BHTVersion 5.0' "${BHT_INFO}"
           else
@@ -76,11 +116,11 @@ jobs:
           fi
 
           echo "BHTwitter version: $(/usr/libexec/PlistBuddy -c 'Print :BHTVersion' "${BHT_INFO}")"
-
           rm -f "${RELEASE_FILE}"
           (cd patched && zip -qry "../${RELEASE_FILE}" .)
+          test -s "${RELEASE_FILE}"
 
-      - name: Publish GitHub Release
+      - name: Publish public GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -91,14 +131,15 @@ jobs:
             gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${EXISTING_ID}"
           fi
 
-          if git ls-remote --tags "https://github.com/${GITHUB_REPOSITORY}.git" "refs/tags/${RELEASE_TAG}" | grep -q .; then
-            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG#v}" || true
+          TAG_REF="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.ref' 2>/dev/null || true)"
+          if [ -n "${TAG_REF}" ]; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}"
           fi
 
           gh release create "${RELEASE_TAG}" "${RELEASE_FILE}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "master" \
             --title "${RELEASE_NAME}" \
-            --notes $'## BHTwitter 5.0\n\n**Supported X version: 12.16**\n\nOfficial BHTwitter 5.0 release targeting X 12.16. Includes the X 12.16 compatibility updates and profile UI compatibility work.'
+            --notes $'## BHTwitter 5.0\n\n**Supported X version: 12.16**\n\nOfficial BHTwitter 5.0 release targeting X 12.16. Includes the current X 12.16 compatibility work and updated profile UI hooks.'
 
           gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}"
