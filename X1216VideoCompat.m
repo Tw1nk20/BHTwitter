@@ -5,16 +5,25 @@
 #import "BHDownloadInlineButton.h"
 
 static const void *BHTVideoLongPressKey = &BHTVideoLongPressKey;
+static IMP BHTOriginalShareLayoutIMP = NULL;
 
-@interface BHTVideoLongPressTarget : NSObject
+typedef void (*BHTVoidIMP)(id, SEL);
+
+@interface BHTVideoLongPressTarget : NSObject <UIGestureRecognizerDelegate>
 @end
 
 @implementation BHTVideoLongPressTarget
+
 + (instancetype)sharedTarget {
     static BHTVideoLongPressTarget *target;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ target = [BHTVideoLongPressTarget new]; });
     return target;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+        shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    return NO;
 }
 
 - (void)bht_handleVideoLongPress:(UILongPressGestureRecognizer *)gesture {
@@ -31,62 +40,93 @@ static const void *BHTVideoLongPressKey = &BHTVideoLongPressKey;
         }
     }
 
-    if (!actionsView || ![actionsView respondsToSelector:NSSelectorFromString(@"viewModel")]) return;
+    if (!actionsView || ![actionsView respondsToSelector:NSSelectorFromString(@"viewModel")]) {
+        NSLog(@"[BHTwitter][X12.16] Video long press: actionsView/viewModel unavailable");
+        return;
+    }
 
     id viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, NSSelectorFromString(@"viewModel"));
-    if (!viewModel || ![BHTManager isVideoCell:viewModel]) return;
+    BOOL isVideo = viewModel && [BHTManager isVideoCell:viewModel];
+    NSLog(@"[BHTwitter][X12.16] Video long press fired. viewModel=%@ isVideo=%d",
+          viewModel ? NSStringFromClass([viewModel class]) : @"nil", isVideo);
 
-    NSLog(@"[BHTwitter][X12.16] Direct video long press fired: %@", NSStringFromClass([viewModel class]));
+    if (!isVideo) return;
 
     BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
     downloadButton.delegate = (id)actionsView;
     downloadButton.viewModel = viewModel;
     [downloadButton DownloadHandler:nil];
 }
+
 @end
 
-static IMP BHTOriginalShareDidMoveToWindowIMP = NULL;
-typedef void (*BHTVoidIMP)(id, SEL);
-
-static void BHTShareDidMoveToWindow(id self, SEL _cmd) {
-    if (BHTOriginalShareDidMoveToWindowIMP) {
-        ((BHTVoidIMP)BHTOriginalShareDidMoveToWindowIMP)(self, _cmd);
-    }
-
-    if (![self isKindOfClass:[UIView class]]) return;
-    UIView *view = (UIView *)self;
-    if (!view.window) return;
-    if (objc_getAssociatedObject(self, BHTVideoLongPressKey)) return;
+static void BHTAttachVideoLongPressIfNeeded(UIView *view) {
+    if (!view || objc_getAssociatedObject(view, BHTVideoLongPressKey)) return;
 
     UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc]
         initWithTarget:[BHTVideoLongPressTarget sharedTarget]
                 action:@selector(bht_handleVideoLongPress:)];
-    gesture.minimumPressDuration = 0.45;
+
+    // Start before X's own long-press/context-menu recognizer so this recognizer
+    // wins the gesture arbitration for video posts.
+    gesture.minimumPressDuration = 0.25;
     gesture.cancelsTouchesInView = YES;
     gesture.delaysTouchesBegan = YES;
-    [view addGestureRecognizer:gesture];
-    objc_setAssociatedObject(self, BHTVideoLongPressKey, gesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    gesture.delegate = [BHTVideoLongPressTarget sharedTarget];
 
-    NSLog(@"[BHTwitter][X12.16] Attached direct long-press recognizer to share button");
+    [view addGestureRecognizer:gesture];
+    objc_setAssociatedObject(view, BHTVideoLongPressKey, gesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSLog(@"[BHTwitter][X12.16] Attached video long-press recognizer to %@", NSStringFromClass([view class]));
+}
+
+static void BHTShareLayoutSubviews(id self, SEL _cmd) {
+    if (BHTOriginalShareLayoutIMP) {
+        ((BHTVoidIMP)BHTOriginalShareLayoutIMP)(self, _cmd);
+    }
+
+    if ([self isKindOfClass:[UIView class]]) {
+        BHTAttachVideoLongPressIfNeeded((UIView *)self);
+    }
 }
 
 static void BHTInstallX1216VideoCompat(void) {
     Class cls = NSClassFromString(@"TTAStatusInlineShareButton");
-    SEL selector = @selector(didMoveToWindow);
-    Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
+    SEL selector = @selector(layoutSubviews);
+    Method inheritedMethod = cls ? class_getInstanceMethod(cls, selector) : NULL;
 
-    if (!method) {
-        NSLog(@"[BHTwitter][X12.16] Could not hook TTAStatusInlineShareButton didMoveToWindow");
+    if (!cls || !inheritedMethod) {
+        NSLog(@"[BHTwitter][X12.16] Could not install share-button layout hook");
         return;
     }
 
-    IMP current = method_getImplementation(method);
-    IMP replacement = (IMP)BHTShareDidMoveToWindow;
-    if (current == replacement) return;
+    IMP replacement = (IMP)BHTShareLayoutSubviews;
+    const char *types = method_getTypeEncoding(inheritedMethod);
+    BHTOriginalShareLayoutIMP = method_getImplementation(inheritedMethod);
 
-    BHTOriginalShareDidMoveToWindowIMP = current;
-    method_setImplementation(method, replacement);
-    NSLog(@"[BHTwitter][X12.16] Installed direct share-button gesture fallback");
+    // Add a class-local override when layoutSubviews is inherited. This avoids
+    // accidentally replacing UIView's implementation globally.
+    if (!class_addMethod(cls, selector, replacement, types)) {
+        Method ownMethod = class_getInstanceMethod(cls, selector);
+        if (!ownMethod) return;
+        BHTOriginalShareLayoutIMP = method_getImplementation(ownMethod);
+        method_setImplementation(ownMethod, replacement);
+    }
+
+    NSLog(@"[BHTwitter][X12.16] Installed share-button layout hook");
+
+    // Also attach immediately to any share buttons already visible before the hook.
+    for (UIWindow *window in UIApplication.sharedApplication.windows) {
+        NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
+        while (stack.count) {
+            UIView *view = stack.lastObject;
+            [stack removeLastObject];
+            if ([view isKindOfClass:cls]) {
+                BHTAttachVideoLongPressIfNeeded(view);
+            }
+            [stack addObjectsFromArray:view.subviews];
+        }
+    }
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
