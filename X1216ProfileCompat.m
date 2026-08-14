@@ -8,10 +8,37 @@ static const NSInteger BHTProfileCopyButtonTag = 1216001;
 static IMP BHTOriginalProfileHeaderLayoutIMP = NULL;
 typedef void (*BHTLayoutIMP)(id, SEL);
 
+// X 12.16 must not execute the legacy Tweak.x profile-copy hook because it
+// relies on the removed/private _innerContentView hierarchy. Keep the user's
+// preference intact in NSUserDefaults, but make the legacy BHTManager gate
+// return NO. This compatibility file reads the preference directly.
+static BOOL BHTLegacyCopyProfileInfoDisabled(id self, SEL _cmd) {
+    return NO;
+}
+
+static BOOL BHTX1216CopyProfileInfoEnabled(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"CopyProfileInfo"];
+}
+
+static void BHTDisableLegacyProfileCopyHook(void) {
+    Class managerClass = NSClassFromString(@"BHTManager");
+    SEL selector = NSSelectorFromString(@"CopyProfileInfo");
+    Method method = managerClass ? class_getClassMethod(managerClass, selector) : NULL;
+    if (!method) return;
+
+    Class metaClass = object_getClass(managerClass);
+    class_replaceMethod(metaClass,
+                        selector,
+                        (IMP)BHTLegacyCopyProfileInfoDisabled,
+                        method_getTypeEncoding(method));
+    NSLog(@"[BHTwitter][X12.16] Disabled legacy profile-copy implementation");
+}
+
 static UIViewController *BHTProfileHeaderControllerFromView(UIView *view) {
     UIResponder *responder = view;
+    Class controllerClass = NSClassFromString(@"T1ProfileHeaderViewController");
     while (responder) {
-        if ([responder isKindOfClass:NSClassFromString(@"T1ProfileHeaderViewController")]) {
+        if (controllerClass && [responder isKindOfClass:controllerClass]) {
             return (UIViewController *)responder;
         }
         responder = responder.nextResponder;
@@ -36,10 +63,7 @@ static UIView *BHTFindShareControlInView(UIView *root) {
             BOOL looksLikeShare = [label containsString:@"共有"] ||
                                   [label containsString:@"share"] ||
                                   [identifier containsString:@"share"];
-
-            if (looksLikeShare) {
-                return view;
-            }
+            if (looksLikeShare) return view;
 
             CGFloat w = CGRectGetWidth(view.bounds);
             CGFloat h = CGRectGetHeight(view.bounds);
@@ -55,6 +79,16 @@ static UIView *BHTFindShareControlInView(UIView *root) {
     return fallback;
 }
 
+static NSString *BHTProfileValue(id viewModel, NSString *selectorName) {
+    if (!viewModel || selectorName.length == 0) return nil;
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![viewModel respondsToSelector:selector]) return nil;
+
+    id value = ((id (*)(id, SEL))objc_msgSend)(viewModel, selector);
+    if (![value isKindOfClass:[NSString class]] || [(NSString *)value length] == 0) return nil;
+    return (NSString *)value;
+}
+
 static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, UIView *sourceView) {
     if (!controller || !viewModel || !controller.view.window) return;
 
@@ -63,22 +97,18 @@ static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, U
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
 
     NSArray<NSDictionary *> *items = @[
-        @{ @"selector": @"bio",      @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_1"] ?: @"自己紹介" },
-        @{ @"selector": @"username", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_2"] ?: @"ユーザー名" },
-        @{ @"selector": @"fullName", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_3"] ?: @"表示名" },
-        @{ @"selector": @"url",      @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_4"] ?: @"URL" },
-        @{ @"selector": @"location", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_5"] ?: @"場所" },
+        @{ @"selector": @"bio",      @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_1"] ?: @"プロフィールをコピー" },
+        @{ @"selector": @"username", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_2"] ?: @"ユーザー名をコピー" },
+        @{ @"selector": @"fullName", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_3"] ?: @"名前をコピー" },
+        @{ @"selector": @"url",      @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_4"] ?: @"URLをコピー" },
+        @{ @"selector": @"location", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_5"] ?: @"場所をコピー" },
     ];
 
     for (NSDictionary *item in items) {
-        SEL selector = NSSelectorFromString(item[@"selector"]);
-        if (![viewModel respondsToSelector:selector]) continue;
+        NSString *value = BHTProfileValue(viewModel, item[@"selector"]);
+        if (!value) continue;
 
-        id value = ((id (*)(id, SEL))objc_msgSend)(viewModel, selector);
-        if (![value isKindOfClass:[NSString class]] || [(NSString *)value length] == 0) continue;
-
-        NSString *title = item[@"title"];
-        [alert addAction:[UIAlertAction actionWithTitle:title
+        [alert addAction:[UIAlertAction actionWithTitle:item[@"title"]
                                                      style:UIAlertActionStyleDefault
                                                    handler:^(__unused UIAlertAction *action) {
             UIPasteboard.generalPasteboard.string = value;
@@ -95,7 +125,9 @@ static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, U
         popover.sourceRect = sourceView ? sourceView.bounds : controller.view.bounds;
     }
 
-    [controller presentViewController:alert animated:YES completion:nil];
+    if (!controller.presentedViewController) {
+        [controller presentViewController:alert animated:YES completion:nil];
+    }
 }
 
 @interface BHTProfileCopyTarget : NSObject
@@ -114,12 +146,13 @@ static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, U
     UIViewController *controller = BHTProfileHeaderControllerFromView(sender);
     if (!controller || !controller.view.window) return;
 
+    SEL viewModelSelector = NSSelectorFromString(@"viewModel");
     id viewModel = nil;
-    if ([controller respondsToSelector:NSSelectorFromString(@"viewModel")]) {
-        viewModel = ((id (*)(id, SEL))objc_msgSend)(controller, NSSelectorFromString(@"viewModel"));
+    if ([controller respondsToSelector:viewModelSelector]) {
+        viewModel = ((id (*)(id, SEL))objc_msgSend)(controller, viewModelSelector);
     }
-
     if (!viewModel) return;
+
     BHTShowProfileCopyMenu(controller, viewModel, sender);
 }
 
@@ -132,14 +165,21 @@ static UIButton *BHTEnsureCopyButton(UIView *container) {
     button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = BHTProfileCopyButtonTag;
     button.tintColor = UIColor.labelColor;
-    button.backgroundColor = [UIColor.systemBackgroundColor colorWithAlphaComponent:0.92];
-    button.layer.cornerRadius = 20.0;
+    button.backgroundColor = UIColor.clearColor;
+    button.layer.cornerRadius = 16.0;
     button.layer.borderWidth = 1.0;
-    button.layer.borderColor = [UIColor.separatorColor colorWithAlphaComponent:0.7].CGColor;
-    [button setImage:[UIImage systemImageNamed:@"doc.on.clipboard"] forState:UIControlStateNormal];
+    button.layer.borderColor = [UIColor.separatorColor colorWithAlphaComponent:0.8].CGColor;
+
+    UIImageSymbolConfiguration *config =
+        [UIImageSymbolConfiguration configurationWithPointSize:15.0 weight:UIImageSymbolWeightRegular];
+    UIImage *image = [UIImage systemImageNamed:@"doc.on.clipboard" withConfiguration:config];
+    [button setImage:image forState:UIControlStateNormal];
+    button.accessibilityLabel = @"プロフィール情報をコピー";
+
     [button addTarget:[BHTProfileCopyTarget sharedTarget]
                action:@selector(bht_profileCopyTapped:)
      forControlEvents:UIControlEventTouchUpInside];
+
     [container addSubview:button];
     return button;
 }
@@ -150,49 +190,50 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
     }
 
     if (![self isKindOfClass:[UIView class]]) return;
-    UIView *headerView = (UIView *)self;
 
-    id actionButtonsView = nil;
     SEL actionButtonsSelector = NSSelectorFromString(@"actionButtonsView");
+    id actionButtonsView = nil;
     if ([self respondsToSelector:actionButtonsSelector]) {
         actionButtonsView = ((id (*)(id, SEL))objc_msgSend)(self, actionButtonsSelector);
     }
-
     if (![actionButtonsView isKindOfClass:[UIView class]]) return;
-    UIView *container = (UIView *)actionButtonsView;
 
+    UIView *container = (UIView *)actionButtonsView;
     UIButton *existing = (UIButton *)[container viewWithTag:BHTProfileCopyButtonTag];
-    if (![BHTManager CopyProfileInfo]) {
+
+    if (!BHTX1216CopyProfileInfoEnabled()) {
         [existing removeFromSuperview];
         return;
     }
 
     UIButton *button = BHTEnsureCopyButton(container);
-    if (!button) return;
-
-    CGFloat size = 40.0;
-    CGFloat gap = 8.0;
     UIView *shareControl = BHTFindShareControlInView(container);
 
-    CGRect targetFrame;
+    // Match the compact X profile action buttons and place immediately left of Share.
+    const CGFloat size = 32.0;
+    const CGFloat gap = 7.0;
+    CGRect targetFrame = CGRectZero;
+
     if (shareControl && shareControl != button) {
         CGRect shareFrame = [shareControl.superview convertRect:shareControl.frame toView:container];
         targetFrame = CGRectMake(CGRectGetMinX(shareFrame) - gap - size,
-                                 CGRectGetMidY(shareFrame) - size / 2.0,
+                                 CGRectGetMidY(shareFrame) - size * 0.5,
                                  size,
                                  size);
     } else {
-        targetFrame = CGRectMake(MAX(8.0, CGRectGetWidth(container.bounds) - (size * 2.0) - gap - 8.0),
-                                 0.0,
+        targetFrame = CGRectMake(MAX(0.0, CGRectGetWidth(container.bounds) - size * 2.0 - gap),
+                                 MAX(0.0, (CGRectGetHeight(container.bounds) - size) * 0.5),
                                  size,
                                  size);
     }
 
-    // Keep the button entirely inside the actionButtonsView's interactive bounds.
-    targetFrame.origin.x = MAX(0.0, MIN(targetFrame.origin.x, CGRectGetWidth(container.bounds) - size));
-    targetFrame.origin.y = MAX(0.0, MIN(targetFrame.origin.y, CGRectGetHeight(container.bounds) - size));
+    // Never place the button outside the action row's hit-testable area.
+    targetFrame.origin.x = MAX(0.0, MIN(targetFrame.origin.x, MAX(0.0, CGRectGetWidth(container.bounds) - size)));
+    targetFrame.origin.y = MAX(0.0, MIN(targetFrame.origin.y, MAX(0.0, CGRectGetHeight(container.bounds) - size)));
+
     button.frame = CGRectIntegral(targetFrame);
     button.hidden = NO;
+    button.alpha = 1.0;
     button.userInteractionEnabled = YES;
     [container bringSubviewToFront:button];
 }
@@ -203,7 +244,7 @@ static void BHTInstallX1216ProfileCompat(void) {
     Method inheritedMethod = cls ? class_getInstanceMethod(cls, selector) : NULL;
 
     if (!cls || !inheritedMethod) {
-        NSLog(@"[BHTwitter][X12.16] Could not install safe T1ProfileHeaderView layout hook");
+        NSLog(@"[BHTwitter][X12.16] Could not install profile layout hook");
         return;
     }
 
@@ -211,24 +252,25 @@ static void BHTInstallX1216ProfileCompat(void) {
     IMP replacement = (IMP)BHTProfileHeaderLayoutSubviews;
     BHTOriginalProfileHeaderLayoutIMP = method_getImplementation(inheritedMethod);
 
-    // First try to add a class-local override. If layoutSubviews is inherited,
-    // this is the safe path and leaves UIView's implementation untouched.
+    // If layoutSubviews is inherited, add an override only to T1ProfileHeaderView.
     if (class_addMethod(cls, selector, replacement, types)) {
-        NSLog(@"[BHTwitter][X12.16] Added class-local profile layout override");
+        NSLog(@"[BHTwitter][X12.16] Added safe profile layout override");
         return;
     }
 
-    // The class already owns layoutSubviews, so replacing that method is safe.
+    // Otherwise T1ProfileHeaderView owns it, so replacing that method is local/safe.
     Method ownMethod = class_getInstanceMethod(cls, selector);
     if (!ownMethod) return;
-
     BHTOriginalProfileHeaderLayoutIMP = method_getImplementation(ownMethod);
     method_setImplementation(ownMethod, replacement);
     NSLog(@"[BHTwitter][X12.16] Replaced owned profile layout implementation");
 }
 
 __attribute__((constructor)) static void BHTX1216ProfileCompatInit(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // Disable the legacy hook immediately so a fast profile navigation cannot hit it.
+    BHTDisableLegacyProfileCopyHook();
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         BHTInstallX1216ProfileCompat();
     });
 }
