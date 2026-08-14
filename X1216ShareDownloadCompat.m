@@ -106,8 +106,6 @@ static BOOL BHTLooksLikePostBoundary(UIView *view) {
 static id BHTShareViewModelForShareView(UIView *shareView) {
     if (!shareView) return nil;
 
-    // 1. The share control delegate is the most precise source and normally
-    // belongs to this post's inline actions view.
     SEL delegateSEL = NSSelectorFromString(@"delegate");
     if ([shareView respondsToSelector:delegateSEL]) {
         id delegate = ((id (*)(id, SEL))objc_msgSend)(shareView, delegateSEL);
@@ -115,9 +113,6 @@ static id BHTShareViewModelForShareView(UIView *shareView) {
         if (model) return model;
     }
 
-    // 2. Walk only through this control's direct ancestor chain. Do NOT search
-    // sibling/parent subtrees: detail/reply screens can contain several posts,
-    // and the old broad subtree search could pick a video from another post.
     UIView *view = shareView;
     for (NSUInteger depth = 0; view && depth < 16; depth++, view = view.superview) {
         id model = BHTShareVideoModelFromObject(view);
@@ -157,16 +152,27 @@ static void BHTShowNoVideoError(void) {
                                                                    message:@"This post does not contain a video"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-    [controller presentViewController:alert animated:YES completion:nil];
+    [controller presentViewController:alert animated:NO completion:nil];
 }
 
-static void BHTResetShareGesturesBeforeAlert(UIView *shareView) {
+static void BHTCancelCurrentShareGestureSequence(UIView *shareView) {
     if (!shareView) return;
-    for (UIGestureRecognizer *recognizer in shareView.gestureRecognizers.copy) recognizer.enabled = NO;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        for (UIGestureRecognizer *recognizer in shareView.gestureRecognizers.copy) recognizer.enabled = YES;
-        dispatch_async(dispatch_get_main_queue(), ^{ BHTShowNoVideoError(); });
-    });
+
+    NSMutableArray<UIGestureRecognizer *> *recognizers = [NSMutableArray array];
+    UIView *view = shareView;
+
+    // X 12.16 can keep the native share/context-menu recognizer on a wrapper
+    // above the visible share control. Cancel recognizers up to this post only,
+    // so no recognizer from the original touch remains active when the alert appears.
+    for (NSUInteger depth = 0; view && depth < 16; depth++, view = view.superview) {
+        for (UIGestureRecognizer *recognizer in view.gestureRecognizers.copy) {
+            if (![recognizers containsObject:recognizer]) [recognizers addObject:recognizer];
+        }
+        if (view != shareView && BHTLooksLikePostBoundary(view)) break;
+    }
+
+    for (UIGestureRecognizer *recognizer in recognizers) recognizer.enabled = NO;
+    for (UIGestureRecognizer *recognizer in recognizers) recognizer.enabled = YES;
 }
 
 @interface BHTShareDownloadProxy : NSObject
@@ -189,7 +195,10 @@ static void BHTResetShareGesturesBeforeAlert(UIView *shareView) {
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
         shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    return YES;
+    // Do not allow X's native long-press/context-menu recognizer to remain active
+    // alongside BHTwitter's gesture. The BHT gesture has the shorter threshold and
+    // should win before the native menu begins.
+    return NO;
 }
 
 - (void)bht_shareLongPressed:(UILongPressGestureRecognizer *)gesture {
@@ -201,7 +210,15 @@ static void BHTResetShareGesturesBeforeAlert(UIView *shareView) {
     if (!viewModel || !BHTShareItemIsVideo(viewModel)) {
         NSLog(@"[BHTwitter][X12.16] Share long press: current post has no video (%@ / %@)",
               NSStringFromClass(shareView.class), shareView.accessibilityLabel);
-        BHTResetShareGesturesBeforeAlert(shareView);
+
+        BHTCancelCurrentShareGestureSequence(shareView);
+
+        // Wait exactly one main-loop turn after cancelling the originating
+        // touch sequence. This makes the alert immediately interactive without
+        // the previous multi-second dead period.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BHTShowNoVideoError();
+        });
         return;
     }
 
