@@ -8,12 +8,7 @@ static const NSInteger BHTProfileCopyButtonTag = 1216001;
 static IMP BHTOriginalProfileHeaderLayoutIMP = NULL;
 typedef void (*BHTLayoutIMP)(id, SEL);
 
-// Prevent the legacy Logos profile-copy hook from executing on X 12.16.
-// The compatibility implementation below reads the preference directly.
-static BOOL BHTLegacyCopyProfileInfoDisabled(id self, SEL _cmd) {
-    return NO;
-}
-
+static BOOL BHTLegacyCopyProfileInfoDisabled(id self, SEL _cmd) { return NO; }
 static BOOL BHTX1216CopyProfileInfoEnabled(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:@"CopyProfileInfo"];
 }
@@ -23,141 +18,94 @@ static void BHTDisableLegacyProfileCopyHook(void) {
     SEL selector = NSSelectorFromString(@"CopyProfileInfo");
     Method method = managerClass ? class_getClassMethod(managerClass, selector) : NULL;
     if (!method) return;
-
     Class metaClass = object_getClass(managerClass);
-    class_replaceMethod(metaClass,
-                        selector,
-                        (IMP)BHTLegacyCopyProfileInfoDisabled,
-                        method_getTypeEncoding(method));
+    class_replaceMethod(metaClass, selector, (IMP)BHTLegacyCopyProfileInfoDisabled, method_getTypeEncoding(method));
 }
 
 static UIViewController *BHTProfileHeaderControllerFromView(UIView *view) {
     UIResponder *responder = view;
     Class cls = NSClassFromString(@"T1ProfileHeaderViewController");
     while (responder) {
-        if (cls && [responder isKindOfClass:cls]) {
-            return (UIViewController *)responder;
-        }
+        if (cls && [responder isKindOfClass:cls]) return (UIViewController *)responder;
         responder = responder.nextResponder;
     }
     return nil;
 }
 
-// X 12.16 contains more than one share-like control in the profile header:
-// one in the navigation/cover overlay and one in the actual profile action row.
-// Choose the lowest visible share control so the copy button follows the
-// profile action-row Share button rather than the navigation one.
 static UIView *BHTFindProfileShareControlInView(UIView *root) {
     if (!root) return nil;
-
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     UIView *best = nil;
     CGFloat bestMidY = -CGFLOAT_MAX;
-
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
-
         if (view != root && view.tag != BHTProfileCopyButtonTag && !view.hidden && view.alpha > 0.01) {
             NSString *label = view.accessibilityLabel.lowercaseString ?: @"";
             NSString *identifier = view.accessibilityIdentifier.lowercaseString ?: @"";
-            BOOL looksLikeShare = [label containsString:@"共有"] ||
-                                  [label containsString:@"share"] ||
-                                  [identifier containsString:@"share"];
-
+            BOOL looksLikeShare = [label containsString:@"共有"] || [label containsString:@"share"] || [identifier containsString:@"share"];
             if (looksLikeShare && view.superview) {
                 CGRect frameInHeader = [view.superview convertRect:view.frame toView:root];
                 CGFloat midY = CGRectGetMidY(frameInHeader);
-                if (midY > bestMidY) {
-                    bestMidY = midY;
-                    best = view;
-                }
+                if (midY > bestMidY) { bestMidY = midY; best = view; }
             }
         }
-
         [stack addObjectsFromArray:view.subviews];
     }
-
     return best;
 }
 
 static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, UIView *sourceView) {
     if (!controller || !viewModel || !controller.view.window) return;
-
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"プロフィール情報をコピー"
-                                                                   message:nil
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"プロフィール情報をコピー" message:nil preferredStyle:UIAlertControllerStyleActionSheet];
     NSArray<NSDictionary *> *items = @[
-        @{ @"selector": @"bio",      @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_1"] ?: @"自己紹介" },
+        @{ @"selector": @"bio", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_1"] ?: @"自己紹介" },
         @{ @"selector": @"username", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_2"] ?: @"ユーザー名" },
         @{ @"selector": @"fullName", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_3"] ?: @"表示名" },
-        @{ @"selector": @"url",      @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_4"] ?: @"URL" },
+        @{ @"selector": @"url", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_4"] ?: @"URL" },
         @{ @"selector": @"location", @"title": [[BHTBundle sharedBundle] localizedStringForKey:@"COPY_PROFILE_INFO_MENU_OPTION_5"] ?: @"場所" },
     ];
-
     for (NSDictionary *item in items) {
         SEL selector = NSSelectorFromString(item[@"selector"]);
         if (![viewModel respondsToSelector:selector]) continue;
-
         id value = ((id (*)(id, SEL))objc_msgSend)(viewModel, selector);
         if (![value isKindOfClass:[NSString class]] || [(NSString *)value length] == 0) continue;
-
-        NSString *title = item[@"title"];
-        [alert addAction:[UIAlertAction actionWithTitle:title
-                                                     style:UIAlertActionStyleDefault
-                                                   handler:^(__unused UIAlertAction *action) {
+        [alert addAction:[UIAlertAction actionWithTitle:item[@"title"] style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
             UIPasteboard.generalPasteboard.string = value;
         }]];
     }
-
-    [alert addAction:[UIAlertAction actionWithTitle:@"キャンセル"
-                                             style:UIAlertActionStyleCancel
-                                           handler:nil]];
-
+    [alert addAction:[UIAlertAction actionWithTitle:@"キャンセル" style:UIAlertActionStyleCancel handler:nil]];
     UIPopoverPresentationController *popover = alert.popoverPresentationController;
     if (popover) {
         popover.sourceView = sourceView ?: controller.view;
         popover.sourceRect = sourceView ? sourceView.bounds : controller.view.bounds;
     }
-
-    if (!controller.presentedViewController) {
-        [controller presentViewController:alert animated:YES completion:nil];
-    }
+    if (!controller.presentedViewController) [controller presentViewController:alert animated:YES completion:nil];
 }
 
 @interface BHTProfileCopyTarget : NSObject
 @end
-
 @implementation BHTProfileCopyTarget
-
 + (instancetype)sharedTarget {
     static BHTProfileCopyTarget *target;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ target = [BHTProfileCopyTarget new]; });
     return target;
 }
-
 - (void)bht_profileCopyTapped:(UIButton *)sender {
     UIViewController *controller = BHTProfileHeaderControllerFromView(sender);
     if (!controller || !controller.view.window) return;
-
     SEL selector = NSSelectorFromString(@"viewModel");
     id viewModel = nil;
-    if ([controller respondsToSelector:selector]) {
-        viewModel = ((id (*)(id, SEL))objc_msgSend)(controller, selector);
-    }
+    if ([controller respondsToSelector:selector]) viewModel = ((id (*)(id, SEL))objc_msgSend)(controller, selector);
     if (!viewModel) return;
-
     BHTShowProfileCopyMenu(controller, viewModel, sender);
 }
-
 @end
 
 static UIButton *BHTEnsureCopyButton(UIView *headerView) {
     UIButton *button = (UIButton *)[headerView viewWithTag:BHTProfileCopyButtonTag];
     if (button) return button;
-
     button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = BHTProfileCopyButtonTag;
     button.tintColor = UIColor.labelColor;
@@ -167,54 +115,45 @@ static UIButton *BHTEnsureCopyButton(UIView *headerView) {
     button.layer.borderColor = [UIColor.separatorColor colorWithAlphaComponent:0.7].CGColor;
     [button setImage:[UIImage systemImageNamed:@"doc.on.clipboard"] forState:UIControlStateNormal];
     button.accessibilityLabel = @"プロフィール情報をコピー";
-    [button addTarget:[BHTProfileCopyTarget sharedTarget]
-               action:@selector(bht_profileCopyTapped:)
-     forControlEvents:UIControlEventTouchUpInside];
+    [button addTarget:[BHTProfileCopyTarget sharedTarget] action:@selector(bht_profileCopyTapped:) forControlEvents:UIControlEventTouchUpInside];
     [headerView addSubview:button];
     return button;
 }
 
 static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
-    if (BHTOriginalProfileHeaderLayoutIMP) {
-        ((BHTLayoutIMP)BHTOriginalProfileHeaderLayoutIMP)(self, _cmd);
-    }
-
+    if (BHTOriginalProfileHeaderLayoutIMP) ((BHTLayoutIMP)BHTOriginalProfileHeaderLayoutIMP)(self, _cmd);
     if (![self isKindOfClass:[UIView class]]) return;
     UIView *headerView = (UIView *)self;
-
     UIButton *existing = (UIButton *)[headerView viewWithTag:BHTProfileCopyButtonTag];
     if (!BHTX1216CopyProfileInfoEnabled()) {
         [existing removeFromSuperview];
         return;
     }
-
     UIButton *button = BHTEnsureCopyButton(headerView);
     if (!button) return;
 
     const CGFloat size = 36.0;
     const CGFloat gap = 8.0;
+    const CGFloat xOffset = 14.0;
+    const CGFloat yOffset = 90.0;
     UIView *shareControl = BHTFindProfileShareControlInView(headerView);
     CGRect targetFrame = CGRectZero;
 
     if (shareControl && shareControl != button && shareControl.superview) {
         CGRect shareFrame = [shareControl.superview convertRect:shareControl.frame toView:headerView];
-        targetFrame = CGRectMake(CGRectGetMinX(shareFrame) - gap - size,
-                                 CGRectGetMidY(shareFrame) - size * 0.5,
+        targetFrame = CGRectMake(CGRectGetMinX(shareFrame) - gap - size + xOffset,
+                                 CGRectGetMidY(shareFrame) - size * 0.5 + yOffset,
                                  size,
                                  size);
     } else {
-        // Fallback near the profile action row rather than the cover controls.
-        targetFrame = CGRectMake(MAX(8.0, CGRectGetWidth(headerView.bounds) - 92.0 - size),
-                                 MAX(4.0, CGRectGetHeight(headerView.bounds) * 0.36),
+        targetFrame = CGRectMake(MAX(8.0, CGRectGetWidth(headerView.bounds) - 78.0 - size),
+                                 MAX(4.0, CGRectGetHeight(headerView.bounds) * 0.52),
                                  size,
                                  size);
     }
 
-    targetFrame.origin.x = MAX(4.0, MIN(targetFrame.origin.x,
-                                        MAX(4.0, CGRectGetWidth(headerView.bounds) - size - 4.0)));
-    targetFrame.origin.y = MAX(4.0, MIN(targetFrame.origin.y,
-                                        MAX(4.0, CGRectGetHeight(headerView.bounds) - size - 4.0)));
-
+    targetFrame.origin.x = MAX(4.0, MIN(targetFrame.origin.x, MAX(4.0, CGRectGetWidth(headerView.bounds) - size - 4.0)));
+    targetFrame.origin.y = MAX(4.0, MIN(targetFrame.origin.y, MAX(4.0, CGRectGetHeight(headerView.bounds) - size - 4.0)));
     button.frame = CGRectIntegral(targetFrame);
     button.hidden = NO;
     button.alpha = 1.0;
@@ -226,18 +165,13 @@ static void BHTInstallX1216ProfileCompat(void) {
     Class cls = NSClassFromString(@"T1ProfileHeaderView");
     SEL selector = @selector(layoutSubviews);
     Method inheritedMethod = cls ? class_getInstanceMethod(cls, selector) : NULL;
-
     if (!cls || !inheritedMethod) return;
-
     const char *types = method_getTypeEncoding(inheritedMethod);
     IMP replacement = (IMP)BHTProfileHeaderLayoutSubviews;
     BHTOriginalProfileHeaderLayoutIMP = method_getImplementation(inheritedMethod);
-
     if (class_addMethod(cls, selector, replacement, types)) return;
-
     Method ownMethod = class_getInstanceMethod(cls, selector);
     if (!ownMethod) return;
-
     BHTOriginalProfileHeaderLayoutIMP = method_getImplementation(ownMethod);
     method_setImplementation(ownMethod, replacement);
 }
