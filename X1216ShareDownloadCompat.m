@@ -6,15 +6,15 @@
 static const void *BHTShareDownloadGestureKey = &BHTShareDownloadGestureKey;
 static const void *BHTShareDownloadProxyKey = &BHTShareDownloadProxyKey;
 static const void *BHTShareDownloaderKey = &BHTShareDownloaderKey;
-static const void *BHTSharePendingModelKey = &BHTSharePendingModelKey;
 static const void *BHTSharePausedRecognizersKey = &BHTSharePausedRecognizersKey;
 
 static IMP BHTOriginalViewDidMoveToWindowIMP = NULL;
 static IMP BHTOriginalT1ShareLayoutIMP = NULL;
 static IMP BHTOriginalTTAShareLayoutIMP = NULL;
 typedef void (*BHTViewVoidIMP)(id, SEL);
-
 typedef void (*BHTShareLayoutIMP)(id, SEL);
+
+#pragma mark - Media detection
 
 static BOOL BHTShareItemIsVideo(id item) {
     if (!item || item == [NSNull null]) return NO;
@@ -35,8 +35,8 @@ static BOOL BHTShareItemIsVideo(id item) {
                     NSInteger type = ((NSInteger (*)(id, SEL))objc_msgSend)(media, typeSEL);
                     if (type == 2 || type == 3) return YES;
                 }
-                SEL videoInfoSEL = NSSelectorFromString(@"videoInfo");
-                if ([media respondsToSelector:videoInfoSEL] && ((id (*)(id, SEL))objc_msgSend)(media, videoInfoSEL)) return YES;
+                SEL infoSEL = NSSelectorFromString(@"videoInfo");
+                if ([media respondsToSelector:infoSEL] && ((id (*)(id, SEL))objc_msgSend)(media, infoSEL)) return YES;
             }
         }
     }
@@ -46,16 +46,16 @@ static BOOL BHTShareItemIsVideo(id item) {
         id entities = ((id (*)(id, SEL))objc_msgSend)(item, entitiesSEL);
         SEL mediaSEL = NSSelectorFromString(@"media");
         if ([entities respondsToSelector:mediaSEL]) {
-            id media = ((id (*)(id, SEL))objc_msgSend)(entities, mediaSEL);
-            if ([media isKindOfClass:[NSArray class]]) {
-                for (id entity in (NSArray *)media) {
+            id mediaArray = ((id (*)(id, SEL))objc_msgSend)(entities, mediaSEL);
+            if ([mediaArray isKindOfClass:[NSArray class]]) {
+                for (id media in (NSArray *)mediaArray) {
                     SEL typeSEL = NSSelectorFromString(@"mediaType");
-                    if ([entity respondsToSelector:typeSEL]) {
-                        NSInteger type = ((NSInteger (*)(id, SEL))objc_msgSend)(entity, typeSEL);
+                    if ([media respondsToSelector:typeSEL]) {
+                        NSInteger type = ((NSInteger (*)(id, SEL))objc_msgSend)(media, typeSEL);
                         if (type == 2 || type == 3) return YES;
                     }
-                    SEL videoInfoSEL = NSSelectorFromString(@"videoInfo");
-                    if ([entity respondsToSelector:videoInfoSEL] && ((id (*)(id, SEL))objc_msgSend)(entity, videoInfoSEL)) return YES;
+                    SEL infoSEL = NSSelectorFromString(@"videoInfo");
+                    if ([media respondsToSelector:infoSEL] && ((id (*)(id, SEL))objc_msgSend)(media, infoSEL)) return YES;
                 }
             }
         }
@@ -77,8 +77,7 @@ static id BHTShareVideoModelFromObject(id object) {
         id model = ((id (*)(id, SEL))objc_msgSend)(object, viewModelSEL);
         if (model && BHTShareItemIsVideo(model)) return model;
     }
-    if (BHTShareItemIsVideo(object)) return object;
-    return nil;
+    return BHTShareItemIsVideo(object) ? object : nil;
 }
 
 static BOOL BHTLooksLikeShareControl(UIView *view) {
@@ -86,7 +85,6 @@ static BOOL BHTLooksLikeShareControl(UIView *view) {
     NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
     NSString *label = view.accessibilityLabel.lowercaseString ?: @"";
     NSString *identifier = view.accessibilityIdentifier.lowercaseString ?: @"";
-
     return [className containsString:@"sharebutton"] ||
            [className containsString:@"share_button"] ||
            [identifier containsString:@"share"] ||
@@ -109,10 +107,8 @@ static BOOL BHTLooksLikePostBoundary(UIView *view) {
 }
 
 static UIView *BHTNearestPostBoundary(UIView *shareView) {
-    UIView *view = shareView;
     UIView *fallback = nil;
-    for (NSUInteger depth = 0; view && depth < 20; depth++, view = view.superview) {
-        NSString *name = NSStringFromClass(view.class).lowercaseString ?: @"";
+    for (UIView *view = shareView; view; view = view.superview) {
         if ([view isKindOfClass:[UITableViewCell class]] || [view isKindOfClass:[UICollectionViewCell class]]) return view;
         if (BHTLooksLikePostBoundary(view)) return view;
         if (!fallback && CGRectGetWidth(view.bounds) >= 280.0 && CGRectGetHeight(view.bounds) >= 100.0) fallback = view;
@@ -124,11 +120,9 @@ static id BHTFindVideoModelInsidePost(UIView *postRoot) {
     if (!postRoot) return nil;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:postRoot];
     NSUInteger visited = 0;
-
-    while (stack.count && visited < 600) {
+    while (stack.count && visited++ < 600) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
-        visited++;
 
         id model = BHTShareVideoModelFromObject(view);
         if (model) return model;
@@ -151,8 +145,6 @@ static id BHTFindVideoModelInsidePost(UIView *postRoot) {
 static id BHTShareViewModelForShareView(UIView *shareView) {
     if (!shareView) return nil;
 
-    // First try the current inline-actions delegate. This is the exact post in
-    // most X 12.16 feed/detail layouts.
     SEL delegateSEL = NSSelectorFromString(@"delegate");
     if ([shareView respondsToSelector:delegateSEL]) {
         id delegate = ((id (*)(id, SEL))objc_msgSend)(shareView, delegateSEL);
@@ -160,22 +152,21 @@ static id BHTShareViewModelForShareView(UIView *shareView) {
         if (model) return model;
     }
 
-    // Recycled feed cells can have a wrapper whose delegate path is stale or
-    // temporarily empty after scrolling. Re-scan only the nearest current post
-    // boundary; never search sibling posts, which caused false video matches.
     UIView *postRoot = BHTNearestPostBoundary(shareView);
     id model = BHTFindVideoModelInsidePost(postRoot);
     if (model) return model;
 
-    // Final narrow ancestor fallback, still stopping at the current post.
-    UIView *view = shareView;
-    for (NSUInteger depth = 0; view && depth < 20; depth++, view = view.superview) {
+    for (UIView *view = shareView; view; view = view.superview) {
         model = BHTShareVideoModelFromObject(view);
         if (model) return model;
-        if (view != shareView && BHTLooksLikePostBoundary(view)) break;
+        if (view != shareView && (BHTLooksLikePostBoundary(view) ||
+                                  [view isKindOfClass:[UITableViewCell class]] ||
+                                  [view isKindOfClass:[UICollectionViewCell class]])) break;
     }
     return nil;
 }
+
+#pragma mark - UI helpers
 
 static UIViewController *BHTTopViewController(void) {
     UIWindow *window = nil;
@@ -196,6 +187,12 @@ static UIViewController *BHTTopViewController(void) {
         break;
     }
     return controller;
+}
+
+static void BHTImpactTap(void) {
+    UIImpactFeedbackGenerator *generator = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [generator prepare];
+    [generator impactOccurred];
 }
 
 static void BHTShowNoVideoError(void) {
@@ -227,9 +224,6 @@ static NSArray<UIGestureRecognizer *> *BHTPauseCompetingRecognizers(UIView *shar
                                                                     UIGestureRecognizer *bhtGesture) {
     if (!shareView) return @[];
     NSMutableArray<UIGestureRecognizer *> *paused = [NSMutableArray array];
-
-    // Include recognizers inside the visible share control; UIContextMenuInteraction
-    // can install its private recognizer on an internal subview rather than the wrapper.
     BHTCollectRecognizersInViewTree(shareView, bhtGesture, paused);
 
     UIView *view = shareView.superview;
@@ -247,6 +241,8 @@ static NSArray<UIGestureRecognizer *> *BHTPauseCompetingRecognizers(UIView *shar
 static void BHTResumeRecognizers(NSArray<UIGestureRecognizer *> *recognizers) {
     for (UIGestureRecognizer *recognizer in recognizers) recognizer.enabled = YES;
 }
+
+#pragma mark - Long press target
 
 @interface BHTShareDownloadProxy : NSObject
 @property (nonatomic, strong) id viewModel;
@@ -268,8 +264,8 @@ static void BHTResumeRecognizers(NSArray<UIGestureRecognizer *> *recognizers) {
 
 - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
         shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-    // Let the BHT recognizer reach Began even if X has already attached a native
-    // context-menu recognizer. At Began, BHT disables the competing recognizers.
+    // Let BHTwitter reach Began even when X has already installed its own context-menu recognizer.
+    // The native recognizer is disabled immediately afterwards.
     return YES;
 }
 
@@ -296,53 +292,43 @@ static void BHTResumeRecognizers(NSArray<UIGestureRecognizer *> *recognizers) {
     if (!shareView || !shareView.window) return;
 
     if (gesture.state == UIGestureRecognizerStateBegan) {
-        id viewModel = BHTShareViewModelForShareView(shareView);
-        objc_setAssociatedObject(shareView, BHTSharePendingModelKey, viewModel ?: [NSNull null], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // Long press has just become valid: provide the requested short tactile "tap" now.
+        BHTImpactTap();
 
+        // Freeze X's native share/context-menu recognizers before they can present their sheet.
         NSArray *paused = BHTPauseCompetingRecognizers(shareView, gesture);
         objc_setAssociatedObject(shareView, BHTSharePausedRecognizersKey, paused, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return;
-    }
 
-    if (gesture.state == UIGestureRecognizerStateEnded) {
-        NSArray *paused = objc_getAssociatedObject(shareView, BHTSharePausedRecognizersKey) ?: @[];
-        id pending = objc_getAssociatedObject(shareView, BHTSharePendingModelKey);
-        objc_setAssociatedObject(shareView, BHTSharePausedRecognizersKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(shareView, BHTSharePendingModelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-        // Re-check the current post at release. This matters after cell reuse and
-        // scrolling, where a model captured earlier can no longer describe the
-        // visible post.
-        id currentModel = BHTShareViewModelForShareView(shareView);
-        id model = BHTShareItemIsVideo(currentModel) ? currentModel : (BHTShareItemIsVideo(pending) ? pending : nil);
-
-        // Keep native recognizers disabled until the popup has been requested;
-        // otherwise X can present its standard menu in the same run-loop turn.
-        if (model) {
-            [self bht_presentDownloadForShareView:shareView viewModel:model];
+        // Re-resolve the current model at the exact moment the gesture fires. This is important
+        // for recycled feed cells after scrolling.
+        id viewModel = BHTShareViewModelForShareView(shareView);
+        if (viewModel && BHTShareItemIsVideo(viewModel)) {
+            [self bht_presentDownloadForShareView:shareView viewModel:viewModel];
         } else {
             BHTShowNoVideoError();
         }
-
-        dispatch_async(dispatch_get_main_queue(), ^{ BHTResumeRecognizers(paused); });
         return;
     }
 
-    if (gesture.state == UIGestureRecognizerStateCancelled || gesture.state == UIGestureRecognizerStateFailed) {
+    if (gesture.state == UIGestureRecognizerStateEnded ||
+        gesture.state == UIGestureRecognizerStateCancelled ||
+        gesture.state == UIGestureRecognizerStateFailed) {
         NSArray *paused = objc_getAssociatedObject(shareView, BHTSharePausedRecognizersKey) ?: @[];
-        BHTResumeRecognizers(paused);
         objc_setAssociatedObject(shareView, BHTSharePausedRecognizersKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(shareView, BHTSharePendingModelKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        dispatch_async(dispatch_get_main_queue(), ^{ BHTResumeRecognizers(paused); });
     }
 }
 @end
 
+#pragma mark - Installation
+
 static void BHTInstallLongPressIfNeeded(UIView *shareView) {
     if (!shareView || !shareView.window) return;
-    if (!BHTLooksLikeShareControl(shareView)) {
-        NSString *className = NSStringFromClass(shareView.class).lowercaseString ?: @"";
-        if (![className containsString:@"statusinlinesharebutton"]) return;
-    }
+
+    NSString *className = NSStringFromClass(shareView.class).lowercaseString ?: @"";
+    BOOL knownShareClass = [className containsString:@"t1statusinlinesharebutton"] ||
+                           [className containsString:@"ttastatusinlinesharebutton"];
+    if (!knownShareClass && !BHTLooksLikeShareControl(shareView)) return;
     if (objc_getAssociatedObject(shareView, BHTShareDownloadGestureKey)) return;
 
     UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc] initWithTarget:[BHTShareDownloadTarget sharedTarget]
@@ -354,11 +340,6 @@ static void BHTInstallLongPressIfNeeded(UIView *shareView) {
     [shareView addGestureRecognizer:gesture];
     shareView.userInteractionEnabled = YES;
     objc_setAssociatedObject(shareView, BHTShareDownloadGestureKey, gesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-}
-
-static void BHTViewDidMoveToWindow(id self, SEL _cmd) {
-    if (BHTOriginalViewDidMoveToWindowIMP) ((BHTViewVoidIMP)BHTOriginalViewDidMoveToWindowIMP)(self, _cmd);
-    if ([self isKindOfClass:[UIView class]]) BHTInstallLongPressIfNeeded((UIView *)self);
 }
 
 static void BHTT1ShareLayoutSubviews(id self, SEL _cmd) {
@@ -374,27 +355,35 @@ static void BHTTTAShareLayoutSubviews(id self, SEL _cmd) {
 static void BHTInstallShareLayoutHook(Class cls, IMP replacement, IMP *originalOut) {
     if (!cls || !originalOut) return;
     SEL selector = @selector(layoutSubviews);
-    Method inherited = class_getInstanceMethod(cls, selector);
-    if (!inherited) return;
-    const char *types = method_getTypeEncoding(inherited);
-    IMP original = method_getImplementation(inherited);
-    if (class_addMethod(cls, selector, replacement, types)) { *originalOut = original; return; }
-    Method own = class_getInstanceMethod(cls, selector);
-    if (!own) return;
-    *originalOut = method_getImplementation(own);
-    method_setImplementation(own, replacement);
+    Method method = class_getInstanceMethod(cls, selector);
+    if (!method) return;
+    const char *types = method_getTypeEncoding(method);
+    IMP original = method_getImplementation(method);
+
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    Method own = NULL;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) == selector) { own = methods[i]; break; }
+    }
+    free(methods);
+
+    if (own) {
+        *originalOut = method_getImplementation(own);
+        method_setImplementation(own, replacement);
+    } else {
+        *originalOut = original;
+        class_addMethod(cls, selector, replacement, types);
+    }
+}
+
+static void BHTViewDidMoveToWindow(id self, SEL _cmd) {
+    if (BHTOriginalViewDidMoveToWindowIMP) ((BHTViewVoidIMP)BHTOriginalViewDidMoveToWindowIMP)(self, _cmd);
+    if ([self isKindOfClass:[UIView class]]) BHTInstallLongPressIfNeeded((UIView *)self);
 }
 
 __attribute__((constructor)) static void BHTX1216ShareDownloadCompatInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        Class viewClass = [UIView class];
-        SEL selector = @selector(didMoveToWindow);
-        Method method = class_getInstanceMethod(viewClass, selector);
-        if (method) {
-            BHTOriginalViewDidMoveToWindowIMP = method_getImplementation(method);
-            method_setImplementation(method, (IMP)BHTViewDidMoveToWindow);
-        }
-
         BHTInstallShareLayoutHook(NSClassFromString(@"T1StatusInlineShareButton"),
                                   (IMP)BHTT1ShareLayoutSubviews,
                                   &BHTOriginalT1ShareLayoutIMP);
@@ -402,6 +391,13 @@ __attribute__((constructor)) static void BHTX1216ShareDownloadCompatInit(void) {
                                   (IMP)BHTTTAShareLayoutSubviews,
                                   &BHTOriginalTTAShareLayoutIMP);
 
-        NSLog(@"[BHTwitter][X12.16] Installed high-priority post-scoped share download hook");
+        Class viewClass = [UIView class];
+        SEL selector = @selector(didMoveToWindow);
+        Method method = class_getInstanceMethod(viewClass, selector);
+        if (method) {
+            BHTOriginalViewDidMoveToWindowIMP = method_getImplementation(method);
+            method_setImplementation(method, (IMP)BHTViewDidMoveToWindow);
+        }
+        NSLog(@"[BHTwitter][X12.16] Installed immediate share long-press download with haptics");
     });
 }
