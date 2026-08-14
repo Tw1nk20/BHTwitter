@@ -131,11 +131,6 @@ jobs:
             gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${EXISTING_ID}"
           fi
 
-          TAG_REF="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.ref' 2>/dev/null || true)"
-          if [ -n "${TAG_REF}" ]; then
-            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${RELEASE_TAG}"
-          fi
-
           gh release create "${RELEASE_TAG}" "${RELEASE_FILE}" \
             --repo "${GITHUB_REPOSITORY}" \
             --target "master" \
