@@ -198,18 +198,41 @@ static UIViewController *BHTTopViewController(void) {
 }
 
 static void BHTShowNoVideoError(void) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *controller = BHTTopViewController();
-        if (!controller) return;
+    UIViewController *controller = BHTTopViewController();
+    if (!controller) return;
 
-        UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:nil
-                                                message:@"This post does not contain a video"
-                                         preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:nil]];
-        [controller presentViewController:alert animated:YES completion:nil];
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:nil
+                                            message:@"This post does not contain a video"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [controller presentViewController:alert animated:YES completion:nil];
+}
+
+static void BHTResetShareGesturesBeforeAlert(UIView *shareView,
+                                             UILongPressGestureRecognizer *bhtGesture) {
+    if (!shareView) return;
+
+    // Reset every recognizer participating in the current long-press sequence.
+    // This releases the touch stream before UIAlertController is presented,
+    // so its OK button can receive touches immediately.
+    for (UIGestureRecognizer *recognizer in shareView.gestureRecognizers.copy) {
+        recognizer.enabled = NO;
+    }
+
+    // Re-enable on the next run-loop turn. Disabled recognizers have already
+    // transitioned to Cancelled and will not resume the current touch sequence.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (UIGestureRecognizer *recognizer in shareView.gestureRecognizers.copy) {
+            recognizer.enabled = YES;
+        }
+
+        // Present only after the originating long press has been fully reset.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            BHTShowNoVideoError();
+        });
     });
 }
 
@@ -247,18 +270,7 @@ static void BHTShowNoVideoError(void) {
     if (!viewModel) {
         NSLog(@"[BHTwitter][X12.16] Share long press: video model not found (%@ / %@)",
               NSStringFromClass(shareView.class), shareView.accessibilityLabel);
-
-        for (UIGestureRecognizer *other in shareView.gestureRecognizers.copy) {
-            if (other != gesture) other.enabled = NO;
-        }
-
-        BHTShowNoVideoError();
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            for (UIGestureRecognizer *other in shareView.gestureRecognizers.copy) {
-                if (other != gesture) other.enabled = YES;
-            }
-        });
+        BHTResetShareGesturesBeforeAlert(shareView, gesture);
         return;
     }
 
