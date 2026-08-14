@@ -152,7 +152,7 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     }
 
     const CGFloat size = 30.0;
-    const CGFloat rightInset = 44.0;
+    const CGFloat rightInset = 40.0;
     const CGFloat bottomInset = 12.0;
     CGFloat width = CGRectGetWidth(host.bounds);
     CGFloat height = CGRectGetHeight(host.bounds);
