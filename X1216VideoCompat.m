@@ -10,8 +10,10 @@ static const void *BHTVideoItemKey = &BHTVideoItemKey;
 static const void *BHTActiveDownloaderKey = &BHTActiveDownloaderKey;
 static const void *BHTActiveDownloadProxyKey = &BHTActiveDownloadProxyKey;
 static IMP BHTOriginalTableCellForItemIMP = NULL;
+static IMP BHTOriginalTableLayoutIMP = NULL;
 
 typedef UITableViewCell *(*BHTTableCellForItemIMP)(id, SEL, id, id);
+typedef void (*BHTVoidIMP)(id, SEL);
 
 static BOOL BHTRuntimeItemIsVideo(id item) {
     if (!item) return NO;
@@ -39,6 +41,12 @@ static BOOL BHTRuntimeItemIsVideo(id item) {
         }
     }
 
+    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
+    if ([item respondsToSelector:viewModelSEL]) {
+        id model = ((id (*)(id, SEL))objc_msgSend)(item, viewModelSEL);
+        if (model && model != item && BHTRuntimeItemIsVideo(model)) return YES;
+    }
+
     SEL tweetSEL = NSSelectorFromString(@"tweet");
     if ([item respondsToSelector:tweetSEL]) {
         id tweet = ((id (*)(id, SEL))objc_msgSend)(item, tweetSEL);
@@ -53,35 +61,54 @@ static UIView *BHTFindActionsView(UIView *root) {
 
     Class ttaClass = NSClassFromString(@"TTAStatusInlineActionsView");
     Class t1Class = NSClassFromString(@"T1StatusInlineActionsView");
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+
+    while (stack.count) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+
+        if ((ttaClass && [view isKindOfClass:ttaClass]) ||
+            (t1Class && [view isKindOfClass:t1Class])) return view;
+
+        if (view.subviews.count) [stack addObjectsFromArray:view.subviews];
+    }
+
+    return nil;
+}
+
+static id BHTFindVideoModelInCell(UITableViewCell *cell) {
+    if (!cell) return nil;
+
+    UIView *root = cell.contentView ?: cell;
+    UIView *actionsView = BHTFindActionsView(cell);
+    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
+
+    if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
+        id model = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
+        if (BHTRuntimeItemIsVideo(model)) return model;
+    }
+
+    id associated = objc_getAssociatedObject(cell, BHTVideoItemKey);
+    if (BHTRuntimeItemIsVideo(associated)) return associated;
 
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
 
-        if ((ttaClass && [view isKindOfClass:ttaClass]) ||
-            (t1Class && [view isKindOfClass:t1Class])) {
-            return view;
+        if ([view respondsToSelector:viewModelSEL]) {
+            id model = ((id (*)(id, SEL))objc_msgSend)(view, viewModelSEL);
+            if (BHTRuntimeItemIsVideo(model)) return model;
         }
 
-        [stack addObjectsFromArray:view.subviews];
+        UIResponder *responder = view.nextResponder;
+        if (responder && [responder respondsToSelector:viewModelSEL]) {
+            id model = ((id (*)(id, SEL))objc_msgSend)(responder, viewModelSEL);
+            if (BHTRuntimeItemIsVideo(model)) return model;
+        }
+
+        if (view.subviews.count) [stack addObjectsFromArray:view.subviews];
     }
-
-    return nil;
-}
-
-static id BHTVideoViewModelForCell(UITableViewCell *cell) {
-    if (!cell) return nil;
-
-    UIView *actionsView = BHTFindActionsView(cell);
-    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
-    if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
-        id viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
-        if (viewModel && BHTRuntimeItemIsVideo(viewModel)) return viewModel;
-    }
-
-    id fallback = objc_getAssociatedObject(cell, BHTVideoItemKey);
-    if (fallback && BHTRuntimeItemIsVideo(fallback)) return fallback;
 
     return nil;
 }
@@ -90,7 +117,6 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
 @property (nonatomic, strong) id viewModel;
 @property (nonatomic, weak) id delegate;
 @end
-
 @implementation BHTDownloadDelegateProxy
 @end
 
@@ -98,7 +124,6 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
 @end
 
 @implementation BHTVideoDownloadTarget
-
 + (instancetype)sharedTarget {
     static BHTVideoDownloadTarget *target;
     static dispatch_once_t onceToken;
@@ -118,21 +143,11 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     }
     if (!cell) return;
 
-    UIView *actionsView = BHTFindActionsView(cell);
-    id viewModel = nil;
-
-    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
-    if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
-        id liveModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
-        if (liveModel && BHTRuntimeItemIsVideo(liveModel)) viewModel = liveModel;
-    }
-
-    if (!viewModel) viewModel = BHTVideoViewModelForCell(cell);
+    id viewModel = BHTFindVideoModelInCell(cell);
     if (!viewModel) return;
 
     BHTDownloadDelegateProxy *proxy = [BHTDownloadDelegateProxy new];
     proxy.viewModel = viewModel;
-    proxy.delegate = nil;
 
     BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
     downloadButton.delegate = (id)proxy;
@@ -145,7 +160,6 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
         [downloadButton DownloadHandler:sender];
     });
 }
-
 @end
 
 static BOOL BHTViewOrLayerLooksLikeVideo(UIView *view) {
@@ -155,9 +169,7 @@ static BOOL BHTViewOrLayerLooksLikeVideo(UIView *view) {
     if ([className containsString:@"video"] ||
         [className containsString:@"player"] ||
         [className containsString:@"media"] ||
-        [className containsString:@"slideshow"]) {
-        return YES;
-    }
+        [className containsString:@"slideshow"]) return YES;
 
     NSMutableArray<CALayer *> *layers = [NSMutableArray arrayWithObject:view.layer];
     while (layers.count) {
@@ -165,7 +177,7 @@ static BOOL BHTViewOrLayerLooksLikeVideo(UIView *view) {
         [layers removeLastObject];
         NSString *layerName = NSStringFromClass(layer.class).lowercaseString ?: @"";
         if ([layerName containsString:@"player"] || [layerName containsString:@"video"]) return YES;
-        [layers addObjectsFromArray:layer.sublayers ?: @[]];
+        if (layer.sublayers.count) [layers addObjectsFromArray:layer.sublayers];
     }
 
     return NO;
@@ -197,7 +209,7 @@ static UIView *BHTFindMainMediaView(UITableViewCell *cell) {
             view.tag != BHTVideoDownloadButtonTag &&
             !view.hidden && view.alpha > 0.05 && view.superview) {
 
-            CGRect frame = [view.superview convertRect:view.frame toView:root];
+            CGRect frame = [view convertRect:view.bounds toView:root];
             CGFloat w = CGRectGetWidth(frame);
             CGFloat h = CGRectGetHeight(frame);
             CGFloat area = w * h;
@@ -221,34 +233,36 @@ static UIView *BHTFindMainMediaView(UITableViewCell *cell) {
             }
         }
 
-        [stack addObjectsFromArray:view.subviews];
+        if (view.subviews.count) [stack addObjectsFromArray:view.subviews];
     }
 
     return best;
 }
 
-static void BHTRemoveVideoButtonOutsideHost(UITableViewCell *cell, UIView *mediaHost) {
+static void BHTRemoveVideoButtonsFromCell(UITableViewCell *cell) {
     if (!cell) return;
-
     UIView *root = cell.contentView ?: cell;
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
-
-        if (view.tag == BHTVideoDownloadButtonTag && view.superview != mediaHost) {
+        if (view.tag == BHTVideoDownloadButtonTag) {
             [view removeFromSuperview];
             continue;
         }
-        [stack addObjectsFromArray:view.subviews];
+        if (view.subviews.count) [stack addObjectsFromArray:view.subviews];
     }
 }
 
-static UIButton *BHTEnsureVideoButton(UIView *mediaHost) {
-    if (!mediaHost) return nil;
+static UIButton *BHTEnsureVideoButton(UITableViewCell *cell) {
+    if (!cell) return nil;
+    UIView *overlayHost = cell.contentView ?: cell;
 
-    UIButton *button = (UIButton *)[mediaHost viewWithTag:BHTVideoDownloadButtonTag];
-    if (button) return button;
+    UIButton *button = (UIButton *)[overlayHost viewWithTag:BHTVideoDownloadButtonTag];
+    if (button && button.superview == overlayHost) return button;
+
+    BHTRemoveVideoButtonsFromCell(cell);
 
     button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.tag = BHTVideoDownloadButtonTag;
@@ -271,42 +285,46 @@ static UIButton *BHTEnsureVideoButton(UIView *mediaHost) {
                action:@selector(bht_downloadVideoTapped:)
      forControlEvents:UIControlEventTouchUpInside];
 
-    [mediaHost addSubview:button];
+    [overlayHost addSubview:button];
     return button;
 }
 
 static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
-    if (!cell) return;
+    if (!cell || !cell.window) return;
 
-    id viewModel = BHTVideoViewModelForCell(cell);
+    UIView *overlayHost = cell.contentView ?: cell;
+    id viewModel = BHTFindVideoModelInCell(cell);
     UIView *mediaHost = viewModel ? BHTFindMainMediaView(cell) : nil;
 
-    if (!viewModel || !mediaHost) {
-        BHTRemoveVideoButtonOutsideHost(cell, nil);
+    if (!viewModel || !mediaHost || !mediaHost.window) {
+        BHTRemoveVideoButtonsFromCell(cell);
         return;
     }
 
-    BHTRemoveVideoButtonOutsideHost(cell, mediaHost);
-
-    UIButton *button = BHTEnsureVideoButton(mediaHost);
+    UIButton *button = BHTEnsureVideoButton(cell);
     if (!button) return;
+
+    CGRect mediaFrame = [mediaHost convertRect:mediaHost.bounds toView:overlayHost];
+    if (CGRectIsNull(mediaFrame) || CGRectIsEmpty(mediaFrame)) {
+        [button removeFromSuperview];
+        return;
+    }
 
     const CGFloat size = 40.0;
     const CGFloat inset = 10.0;
-    button.frame = CGRectIntegral(CGRectMake(inset, inset, size, size));
-    button.autoresizingMask = UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    CGFloat x = CGRectGetMinX(mediaFrame) + inset;
+    CGFloat y = CGRectGetMinY(mediaFrame) + inset;
+
+    button.frame = CGRectIntegral(CGRectMake(x, y, size, size));
+    button.autoresizingMask = UIViewAutoresizingNone;
     button.hidden = NO;
     button.alpha = 1.0;
     button.userInteractionEnabled = YES;
-
-    // Some media containers clip their children intentionally, which is fine;
-    // the button is fully inside the media bounds and should follow rounded corners.
-    [mediaHost bringSubviewToFront:button];
+    [overlayHost bringSubviewToFront:button];
 }
 
 static void BHTScheduleVideoButtonEvaluation(UITableViewCell *cell) {
     if (!cell) return;
-
     dispatch_async(dispatch_get_main_queue(), ^{ BHTApplyVideoButtonToCell(cell); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ BHTApplyVideoButtonToCell(cell); });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.60 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ BHTApplyVideoButtonToCell(cell); });
@@ -333,36 +351,75 @@ static UITableViewCell *BHTVideoTableCellForItem(id self, SEL _cmd, id item, id 
     return cell;
 }
 
-static void BHTInstallVideoTimelineHook(void) {
-    Class cls = NSClassFromString(@"TFNItemsDataViewController");
-    SEL selector = NSSelectorFromString(@"tableViewCellForItem:atIndexPath:");
-    if (!cls) return;
+static void BHTTableLayoutSubviews(id self, SEL _cmd) {
+    if (BHTOriginalTableLayoutIMP) ((BHTVoidIMP)BHTOriginalTableLayoutIMP)(self, _cmd);
 
-    Method method = class_getInstanceMethod(cls, selector);
-    if (!method) return;
+    UITableView *tableView = (UITableView *)self;
+    for (UITableViewCell *cell in tableView.visibleCells) {
+        BHTApplyVideoButtonToCell(cell);
+    }
+}
 
-    const char *types = method_getTypeEncoding(method);
+static void BHTInstallSafeLayoutHook(Class cls, IMP replacement, IMP *originalOut) {
+    if (!cls || !originalOut) return;
+
+    SEL selector = @selector(layoutSubviews);
+    Method inherited = class_getInstanceMethod(cls, selector);
+    if (!inherited) return;
+
+    const char *types = method_getTypeEncoding(inherited);
+    IMP inheritedIMP = method_getImplementation(inherited);
 
     unsigned int count = 0;
     Method *methods = class_copyMethodList(cls, &count);
-    Method ownMethod = NULL;
+    Method own = NULL;
     for (unsigned int i = 0; i < count; i++) {
         if (method_getName(methods[i]) == selector) {
-            ownMethod = methods[i];
+            own = methods[i];
             break;
         }
     }
     free(methods);
 
-    if (ownMethod) {
-        BHTOriginalTableCellForItemIMP = method_getImplementation(ownMethod);
-        method_setImplementation(ownMethod, (IMP)BHTVideoTableCellForItem);
+    if (own) {
+        *originalOut = method_getImplementation(own);
+        method_setImplementation(own, replacement);
     } else {
-        BHTOriginalTableCellForItemIMP = method_getImplementation(method);
-        class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
+        *originalOut = inheritedIMP;
+        class_addMethod(cls, selector, replacement, types);
+    }
+}
+
+static void BHTInstallVideoTimelineHook(void) {
+    Class cls = NSClassFromString(@"TFNItemsDataViewController");
+    SEL selector = NSSelectorFromString(@"tableViewCellForItem:atIndexPath:");
+    if (cls) {
+        Method method = class_getInstanceMethod(cls, selector);
+        if (method) {
+            const char *types = method_getTypeEncoding(method);
+            unsigned int count = 0;
+            Method *methods = class_copyMethodList(cls, &count);
+            Method ownMethod = NULL;
+            for (unsigned int i = 0; i < count; i++) {
+                if (method_getName(methods[i]) == selector) {
+                    ownMethod = methods[i];
+                    break;
+                }
+            }
+            free(methods);
+
+            if (ownMethod) {
+                BHTOriginalTableCellForItemIMP = method_getImplementation(ownMethod);
+                method_setImplementation(ownMethod, (IMP)BHTVideoTableCellForItem);
+            } else {
+                BHTOriginalTableCellForItemIMP = method_getImplementation(method);
+                class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
+            }
+        }
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed video download button on media top-left");
+    BHTInstallSafeLayoutHook([UITableView class], (IMP)BHTTableLayoutSubviews, &BHTOriginalTableLayoutIMP);
+    NSLog(@"[BHTwitter][X12.16] Installed cell-owned video overlay and detail refresh");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
