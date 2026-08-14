@@ -5,8 +5,15 @@
 #import "BHDownloadInlineButton.h"
 
 static const NSInteger BHTVideoDownloadButtonTag = 1216002;
-static IMP BHTOriginalActionsLayoutIMP = NULL;
+static IMP BHTOriginalTTActionsLayoutIMP = NULL;
+static IMP BHTOriginalT1ActionsLayoutIMP = NULL;
 typedef void (*BHTLayoutIMP)(id, SEL);
+
+static BOOL BHTIsActionsView(id obj) {
+    Class tta = NSClassFromString(@"TTAStatusInlineActionsView");
+    Class t1 = NSClassFromString(@"T1StatusInlineActionsView");
+    return (tta && [obj isKindOfClass:tta]) || (t1 && [obj isKindOfClass:t1]);
+}
 
 @interface BHTVideoDownloadTarget : NSObject
 @end
@@ -21,8 +28,7 @@ typedef void (*BHTLayoutIMP)(id, SEL);
 
 - (void)bht_downloadVideoTapped:(UIButton *)sender {
     UIView *actionsView = sender.superview;
-    Class actionsClass = NSClassFromString(@"TTAStatusInlineActionsView");
-    if (!actionsView || ![actionsView isKindOfClass:actionsClass]) return;
+    if (!actionsView || !BHTIsActionsView(actionsView)) return;
 
     SEL viewModelSEL = NSSelectorFromString(@"viewModel");
     if (![actionsView respondsToSelector:viewModelSEL]) return;
@@ -38,20 +44,66 @@ typedef void (*BHTLayoutIMP)(id, SEL);
 @end
 
 static UIView *BHTFindShareButton(UIView *root) {
-    Class shareClass = NSClassFromString(@"TTAStatusInlineShareButton");
-    if (!root || !shareClass) return nil;
+    Class ttaShare = NSClassFromString(@"TTAStatusInlineShareButton");
+    Class t1Share = NSClassFromString(@"T1StatusInlineShareButton");
+    if (!root) return nil;
 
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
-        if ([view isKindOfClass:shareClass]) return view;
+        if ((ttaShare && [view isKindOfClass:ttaShare]) ||
+            (t1Share && [view isKindOfClass:t1Share])) {
+            return view;
+        }
         [stack addObjectsFromArray:view.subviews];
     }
     return nil;
 }
 
+static BOOL BHTViewModelIsVideo(id viewModel) {
+    if (!viewModel) return NO;
+
+    // Primary path used by BHTwitter and confirmed on X 12.16 with FLEX.
+    if ([BHTManager isVideoCell:viewModel]) return YES;
+
+    // Runtime fallback in case protocol dispatch changes while selectors remain.
+    SEL videoSEL = NSSelectorFromString(@"isMediaEntityVideo");
+    SEL gifSEL = NSSelectorFromString(@"isGIF");
+    if ([viewModel respondsToSelector:videoSEL] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(viewModel, videoSEL)) {
+        return YES;
+    }
+    if ([viewModel respondsToSelector:gifSEL] &&
+        ((BOOL (*)(id, SEL))objc_msgSend)(viewModel, gifSEL)) {
+        return YES;
+    }
+
+    // Last fallback: representedMediaEntities was also confirmed on X 12.16.
+    SEL representedSEL = NSSelectorFromString(@"representedMediaEntities");
+    if ([viewModel respondsToSelector:representedSEL]) {
+        id entities = ((id (*)(id, SEL))objc_msgSend)(viewModel, representedSEL);
+        if ([entities isKindOfClass:[NSArray class]]) {
+            for (id media in (NSArray *)entities) {
+                SEL mediaTypeSEL = NSSelectorFromString(@"mediaType");
+                if ([media respondsToSelector:mediaTypeSEL]) {
+                    NSInteger mediaType = ((NSInteger (*)(id, SEL))objc_msgSend)(media, mediaTypeSEL);
+                    // Existing BHTwitter header: 2 = GIF, 3 = video.
+                    if (mediaType == 2 || mediaType == 3) return YES;
+                }
+                NSString *desc = [[media description] lowercaseString];
+                if ([desc containsString:@"mediatype: video"] || [desc containsString:@"mediatype: gif"]) {
+                    return YES;
+                }
+            }
+        }
+    }
+    return NO;
+}
+
 static void BHTLayoutVideoDownloadButton(UIView *actionsView) {
+    if (!BHTIsActionsView(actionsView)) return;
+
     UIButton *button = (UIButton *)[actionsView viewWithTag:BHTVideoDownloadButtonTag];
 
     if (![BHTManager DownloadingVideos]) {
@@ -64,7 +116,7 @@ static void BHTLayoutVideoDownloadButton(UIView *actionsView) {
         ? ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL)
         : nil;
 
-    if (!viewModel || ![BHTManager isVideoCell:viewModel]) {
+    if (!BHTViewModelIsVideo(viewModel)) {
         [button removeFromSuperview];
         return;
     }
@@ -80,28 +132,28 @@ static void BHTLayoutVideoDownloadButton(UIView *actionsView) {
         button.tag = BHTVideoDownloadButtonTag;
         button.backgroundColor = UIColor.clearColor;
         button.accessibilityLabel = @"動画をダウンロード";
-        button.accessibilityIdentifier = @"BHTVideoDownloadButton";
-
-        UIImageSymbolConfiguration *config = [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightRegular];
-        [button setImage:[UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:config] forState:UIControlStateNormal];
+        UIImage *image = [UIImage systemImageNamed:@"arrow.down.to.line"] ?: [UIImage systemImageNamed:@"arrow.down"];
+        [button setImage:image forState:UIControlStateNormal];
         [button addTarget:[BHTVideoDownloadTarget sharedTarget]
                    action:@selector(bht_downloadVideoTapped:)
          forControlEvents:UIControlEventTouchUpInside];
         [actionsView addSubview:button];
-        NSLog(@"[BHTwitter][X12.16] Added dedicated video download button");
     }
 
     CGRect shareRect = [shareButton convertRect:shareButton.bounds toView:actionsView];
-
-    // Regular timeline has enough horizontal gap between bookmark and share.
-    // Use a compact 28pt hit area and place it 10pt to the left of share.
-    CGFloat size = 28.0;
+    CGFloat size = MAX(24.0, MIN(30.0, CGRectGetHeight(shareRect) > 0 ? CGRectGetHeight(shareRect) : 28.0));
     CGFloat spacing = 10.0;
     CGFloat x = CGRectGetMinX(shareRect) - spacing - size;
     CGFloat y = CGRectGetMidY(shareRect) - size / 2.0;
 
-    x = MAX(0.0, MIN(x, CGRectGetWidth(actionsView.bounds) - size));
-    y = MAX(0.0, MIN(y, CGRectGetHeight(actionsView.bounds) - size));
+    // If the share button is very close to the left edge, place the download
+    // button immediately to its right instead of clipping it out of sight.
+    if (x < 0.0) {
+        x = CGRectGetMaxX(shareRect) + spacing;
+    }
+
+    x = MAX(0.0, MIN(x, MAX(0.0, CGRectGetWidth(actionsView.bounds) - size)));
+    y = MAX(0.0, MIN(y, MAX(0.0, CGRectGetHeight(actionsView.bounds) - size)));
 
     button.frame = CGRectIntegral(CGRectMake(x, y, size, size));
     button.tintColor = shareButton.tintColor ?: UIColor.labelColor;
@@ -111,81 +163,76 @@ static void BHTLayoutVideoDownloadButton(UIView *actionsView) {
     [actionsView bringSubviewToFront:button];
 }
 
-static void BHTActionsLayoutSubviews(id self, SEL _cmd) {
-    if (BHTOriginalActionsLayoutIMP) {
-        ((BHTLayoutIMP)BHTOriginalActionsLayoutIMP)(self, _cmd);
+static void BHTTTActionsLayoutSubviews(id self, SEL _cmd) {
+    if (BHTOriginalTTActionsLayoutIMP) {
+        ((BHTLayoutIMP)BHTOriginalTTActionsLayoutIMP)(self, _cmd);
     }
+    if ([self isKindOfClass:[UIView class]]) BHTLayoutVideoDownloadButton((UIView *)self);
+}
 
-    if ([self isKindOfClass:[UIView class]]) {
-        BHTLayoutVideoDownloadButton((UIView *)self);
+static void BHTT1ActionsLayoutSubviews(id self, SEL _cmd) {
+    if (BHTOriginalT1ActionsLayoutIMP) {
+        ((BHTLayoutIMP)BHTOriginalT1ActionsLayoutIMP)(self, _cmd);
+    }
+    if ([self isKindOfClass:[UIView class]]) BHTLayoutVideoDownloadButton((UIView *)self);
+}
+
+static void BHTInstallLayoutOverrideForClass(Class cls, IMP replacement, IMP *originalOut) {
+    if (!cls) return;
+    SEL selector = @selector(layoutSubviews);
+    Method inheritedMethod = class_getInstanceMethod(cls, selector);
+    if (!inheritedMethod) return;
+
+    *originalOut = method_getImplementation(inheritedMethod);
+    const char *types = method_getTypeEncoding(inheritedMethod);
+
+    if (class_addMethod(cls, selector, replacement, types)) return;
+
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    Method ownMethod = NULL;
+    for (unsigned int i = 0; i < count; i++) {
+        if (method_getName(methods[i]) == selector) {
+            ownMethod = methods[i];
+            break;
+        }
+    }
+    free(methods);
+
+    if (ownMethod) {
+        *originalOut = method_getImplementation(ownMethod);
+        method_setImplementation(ownMethod, replacement);
     }
 }
 
-static void BHTApplyToVisibleActionsViews(void) {
-    Class actionsClass = NSClassFromString(@"TTAStatusInlineActionsView");
-    if (!actionsClass) return;
+static void BHTScanVisibleActionsViews(void) {
+    Class tta = NSClassFromString(@"TTAStatusInlineActionsView");
+    Class t1 = NSClassFromString(@"T1StatusInlineActionsView");
 
     for (UIWindow *window in UIApplication.sharedApplication.windows) {
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:window];
         while (stack.count) {
             UIView *view = stack.lastObject;
             [stack removeLastObject];
-
-            if ([view isKindOfClass:actionsClass]) {
+            if ((tta && [view isKindOfClass:tta]) || (t1 && [view isKindOfClass:t1])) {
                 BHTLayoutVideoDownloadButton(view);
             }
-
             [stack addObjectsFromArray:view.subviews];
         }
     }
 }
 
 static void BHTInstallX1216VideoCompat(void) {
-    Class cls = NSClassFromString(@"TTAStatusInlineActionsView");
-    SEL selector = @selector(layoutSubviews);
-    if (!cls) {
-        NSLog(@"[BHTwitter][X12.16] TTAStatusInlineActionsView not found");
-        return;
-    }
+    BHTInstallLayoutOverrideForClass(NSClassFromString(@"TTAStatusInlineActionsView"),
+                                     (IMP)BHTTTActionsLayoutSubviews,
+                                     &BHTOriginalTTActionsLayoutIMP);
+    BHTInstallLayoutOverrideForClass(NSClassFromString(@"T1StatusInlineActionsView"),
+                                     (IMP)BHTT1ActionsLayoutSubviews,
+                                     &BHTOriginalT1ActionsLayoutIMP);
 
-    Method inheritedMethod = class_getInstanceMethod(cls, selector);
-    if (!inheritedMethod) {
-        NSLog(@"[BHTwitter][X12.16] layoutSubviews not found for actions view");
-        return;
-    }
-
-    BHTOriginalActionsLayoutIMP = method_getImplementation(inheritedMethod);
-    const char *types = method_getTypeEncoding(inheritedMethod);
-
-    if (class_addMethod(cls, selector, (IMP)BHTActionsLayoutSubviews, types)) {
-        NSLog(@"[BHTwitter][X12.16] Installed dedicated download-button layout override");
-    } else {
-        unsigned int count = 0;
-        Method *methods = class_copyMethodList(cls, &count);
-        Method ownMethod = NULL;
-        for (unsigned int i = 0; i < count; i++) {
-            if (method_getName(methods[i]) == selector) {
-                ownMethod = methods[i];
-                break;
-            }
-        }
-        free(methods);
-
-        if (ownMethod) {
-            BHTOriginalActionsLayoutIMP = method_getImplementation(ownMethod);
-            method_setImplementation(ownMethod, (IMP)BHTActionsLayoutSubviews);
-            NSLog(@"[BHTwitter][X12.16] Replaced class-local actions layout implementation");
-        } else {
-            NSLog(@"[BHTwitter][X12.16] Could not install actions layout override");
-        }
-    }
-
-    // Existing timeline cells may already be on-screen before this constructor
-    // installs the override. Apply the button immediately, then repeat once after
-    // the initial timeline has settled.
-    BHTApplyToVisibleActionsViews();
+    BHTScanVisibleActionsViews();
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTApplyToVisibleActionsViews();
+        BHTScanVisibleActionsViews();
     });
 }
 
