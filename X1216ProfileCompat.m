@@ -43,10 +43,17 @@ static UIViewController *BHTProfileHeaderControllerFromView(UIView *view) {
     return nil;
 }
 
-static UIView *BHTFindShareControlInView(UIView *root) {
+// X 12.16 contains more than one share-like control in the profile header:
+// one in the navigation/cover overlay and one in the actual profile action row.
+// Choose the lowest visible share control so the copy button follows the
+// profile action-row Share button rather than the navigation one.
+static UIView *BHTFindProfileShareControlInView(UIView *root) {
     if (!root) return nil;
 
     NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    UIView *best = nil;
+    CGFloat bestMidY = -CGFLOAT_MAX;
+
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
@@ -54,16 +61,24 @@ static UIView *BHTFindShareControlInView(UIView *root) {
         if (view != root && view.tag != BHTProfileCopyButtonTag && !view.hidden && view.alpha > 0.01) {
             NSString *label = view.accessibilityLabel.lowercaseString ?: @"";
             NSString *identifier = view.accessibilityIdentifier.lowercaseString ?: @"";
-            if ([label containsString:@"共有"] ||
-                [label containsString:@"share"] ||
-                [identifier containsString:@"share"]) {
-                return view;
+            BOOL looksLikeShare = [label containsString:@"共有"] ||
+                                  [label containsString:@"share"] ||
+                                  [identifier containsString:@"share"];
+
+            if (looksLikeShare && view.superview) {
+                CGRect frameInHeader = [view.superview convertRect:view.frame toView:root];
+                CGFloat midY = CGRectGetMidY(frameInHeader);
+                if (midY > bestMidY) {
+                    bestMidY = midY;
+                    best = view;
+                }
             }
         }
 
         [stack addObjectsFromArray:view.subviews];
     }
-    return nil;
+
+    return best;
 }
 
 static void BHTShowProfileCopyMenu(UIViewController *controller, id viewModel, UIView *sourceView) {
@@ -178,7 +193,7 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
 
     const CGFloat size = 36.0;
     const CGFloat gap = 8.0;
-    UIView *shareControl = BHTFindShareControlInView(headerView);
+    UIView *shareControl = BHTFindProfileShareControlInView(headerView);
     CGRect targetFrame = CGRectZero;
 
     if (shareControl && shareControl != button && shareControl.superview) {
@@ -188,9 +203,9 @@ static void BHTProfileHeaderLayoutSubviews(id self, SEL _cmd) {
                                  size,
                                  size);
     } else {
-        // Safe fallback matching the previously visible X 12.16 header position.
-        targetFrame = CGRectMake(MAX(8.0, CGRectGetWidth(headerView.bounds) - 74.0 - size),
-                                 58.0,
+        // Fallback near the profile action row rather than the cover controls.
+        targetFrame = CGRectMake(MAX(8.0, CGRectGetWidth(headerView.bounds) - 92.0 - size),
+                                 MAX(4.0, CGRectGetHeight(headerView.bounds) * 0.36),
                                  size,
                                  size);
     }
