@@ -81,16 +81,31 @@ static void BHTDiagnosticTap(id self, SEL _cmd, UIButton *sender) {
             [report appendFormat:@"\nattributedString=%@", attr ? @"OK" : @"nil"];
 
             Class modelClass = NSClassFromString(@"TFNAttributedTextModel");
-            id model = modelClass ? [[modelClass alloc] initWithAttributedString:(id)attr] : nil;
+            id model = nil;
+            SEL modelInitSEL = NSSelectorFromString(@"initWithAttributedString:");
+            if (modelClass && class_getInstanceMethod(modelClass, modelInitSEL)) {
+                id allocated = ((id (*)(id, SEL))objc_msgSend)(modelClass, @selector(alloc));
+                model = ((id (*)(id, SEL, id))objc_msgSend)(allocated, modelInitSEL, attr);
+            }
             [report appendFormat:@"\ntextModel=%@", model ? @"OK" : @"nil"];
 
             Class activeClass = NSClassFromString(@"TFNActiveTextItem");
-            id active = activeClass ? [[activeClass alloc] initWithTextModel:model activeRanges:nil] : nil;
+            id active = nil;
+            SEL activeInitSEL = NSSelectorFromString(@"initWithTextModel:activeRanges:");
+            if (activeClass && class_getInstanceMethod(activeClass, activeInitSEL)) {
+                id allocated = ((id (*)(id, SEL))objc_msgSend)(activeClass, @selector(alloc));
+                active = ((id (*)(id, SEL, id, id))objc_msgSend)(allocated, activeInitSEL, model, nil);
+            }
             [report appendFormat:@"\nactiveTextItem=%@", active ? @"OK" : @"nil"];
 
             if (active) {
                 Class sheetClass = NSClassFromString(@"TFNMenuSheetViewController");
-                id sheet = sheetClass ? [[sheetClass alloc] initWithActionItems:@[active]] : nil;
+                id sheet = nil;
+                SEL sheetInitSEL = NSSelectorFromString(@"initWithActionItems:");
+                if (sheetClass && class_getInstanceMethod(sheetClass, sheetInitSEL)) {
+                    id allocated = ((id (*)(id, SEL))objc_msgSend)(sheetClass, @selector(alloc));
+                    sheet = ((id (*)(id, SEL, id))objc_msgSend)(allocated, sheetInitSEL, @[active]);
+                }
                 [report appendFormat:@"\nmenuSheetInit=%@", sheet ? @"OK" : @"nil"];
             }
         }
