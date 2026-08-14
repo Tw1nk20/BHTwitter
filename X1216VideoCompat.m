@@ -4,82 +4,145 @@
 #import "BHTManager.h"
 #import "BHDownloadInlineButton.h"
 
-static IMP BHTInheritedShareLongPressIMP = NULL;
-typedef void (*BHTShareLongPressIMP)(id, SEL, UILongPressGestureRecognizer *);
+static const NSInteger BHTVideoDownloadButtonTag = 1216002;
+static IMP BHTOriginalActionsLayoutIMP = NULL;
+typedef void (*BHTLayoutIMP)(id, SEL);
 
-static id BHTActionsViewForShareButton(id shareButton) {
-    if ([shareButton isKindOfClass:[UIView class]]) {
-        UIView *superview = [(UIView *)shareButton superview];
-        if ([superview isKindOfClass:NSClassFromString(@"TTAStatusInlineActionsView")]) {
-            return superview;
-        }
+@interface BHTVideoDownloadTarget : NSObject
+@end
+
+@implementation BHTVideoDownloadTarget
++ (instancetype)sharedTarget {
+    static BHTVideoDownloadTarget *target;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ target = [BHTVideoDownloadTarget new]; });
+    return target;
+}
+
+- (void)bht_downloadVideoTapped:(UIButton *)sender {
+    UIView *actionsView = sender.superview;
+    Class actionsClass = NSClassFromString(@"TTAStatusInlineActionsView");
+    if (!actionsView || ![actionsView isKindOfClass:actionsClass]) return;
+
+    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
+    if (![actionsView respondsToSelector:viewModelSEL]) return;
+
+    id viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
+    if (!viewModel || ![BHTManager isVideoCell:viewModel]) return;
+
+    BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
+    downloadButton.delegate = (id)actionsView;
+    downloadButton.viewModel = viewModel;
+    [downloadButton DownloadHandler:nil];
+}
+@end
+
+static UIView *BHTFindShareButton(UIView *root) {
+    Class shareClass = NSClassFromString(@"TTAStatusInlineShareButton");
+    if (!root || !shareClass) return nil;
+
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:root];
+    while (stack.count) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+        if ([view isKindOfClass:shareClass]) return view;
+        [stack addObjectsFromArray:view.subviews];
     }
-
-    SEL delegateSEL = NSSelectorFromString(@"delegate");
-    if ([shareButton respondsToSelector:delegateSEL]) {
-        id delegate = ((id (*)(id, SEL))objc_msgSend)(shareButton, delegateSEL);
-        if ([delegate isKindOfClass:NSClassFromString(@"TTAStatusInlineActionsView")]) {
-            return delegate;
-        }
-    }
-
     return nil;
 }
 
-static void BHTX1216ShareLongPress(id self, SEL _cmd, UILongPressGestureRecognizer *gestureRecognizer) {
-    if (gestureRecognizer.state == UIGestureRecognizerStateBegan && [BHTManager DownloadingVideos]) {
-        id actionsView = BHTActionsViewForShareButton(self);
-        SEL viewModelSEL = NSSelectorFromString(@"viewModel");
-        id viewModel = nil;
+static void BHTLayoutVideoDownloadButton(UIView *actionsView) {
+    UIButton *button = (UIButton *)[actionsView viewWithTag:BHTVideoDownloadButtonTag];
 
-        if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
-            viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
-        }
-
-        if (viewModel && [BHTManager isVideoCell:viewModel]) {
-            NSLog(@"[BHTwitter][X12.16] Native share long-press intercepted for video: %@", NSStringFromClass([viewModel class]));
-
-            BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
-            downloadButton.delegate = (id)actionsView;
-            downloadButton.viewModel = viewModel;
-            [downloadButton DownloadHandler:nil];
-            return;
-        }
+    if (![BHTManager DownloadingVideos]) {
+        [button removeFromSuperview];
+        return;
     }
 
-    // Non-video posts and disabled-download mode retain X/BHTwitter's original behavior.
-    if (BHTInheritedShareLongPressIMP) {
-        ((BHTShareLongPressIMP)BHTInheritedShareLongPressIMP)(self, _cmd, gestureRecognizer);
+    SEL viewModelSEL = NSSelectorFromString(@"viewModel");
+    id viewModel = [actionsView respondsToSelector:viewModelSEL]
+        ? ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL)
+        : nil;
+
+    if (!viewModel || ![BHTManager isVideoCell:viewModel]) {
+        [button removeFromSuperview];
+        return;
+    }
+
+    UIView *shareButton = BHTFindShareButton(actionsView);
+    if (!shareButton) {
+        [button removeFromSuperview];
+        return;
+    }
+
+    if (!button) {
+        button = [UIButton buttonWithType:UIButtonTypeSystem];
+        button.tag = BHTVideoDownloadButtonTag;
+        button.tintColor = shareButton.tintColor ?: UIColor.labelColor;
+        button.backgroundColor = UIColor.clearColor;
+        button.accessibilityLabel = @"動画をダウンロード";
+        [button setImage:[UIImage systemImageNamed:@"arrow.down"] forState:UIControlStateNormal];
+        [button addTarget:[BHTVideoDownloadTarget sharedTarget]
+                   action:@selector(bht_downloadVideoTapped:)
+         forControlEvents:UIControlEventTouchUpInside];
+        [actionsView addSubview:button];
+        NSLog(@"[BHTwitter][X12.16] Added dedicated video download button");
+    }
+
+    // Position immediately to the left of X's existing share button. Convert
+    // coordinates in case the share button is wrapped by Swift container views.
+    CGRect shareRect = [shareButton convertRect:shareButton.bounds toView:actionsView];
+    CGFloat size = MAX(24.0, MIN(32.0, CGRectGetHeight(shareRect) > 0 ? CGRectGetHeight(shareRect) : 28.0));
+    CGFloat spacing = 8.0;
+    CGFloat x = CGRectGetMinX(shareRect) - spacing - size;
+    CGFloat y = CGRectGetMidY(shareRect) - size / 2.0;
+
+    // Keep the button inside the visible actions area. If there is no room on
+    // the left, place it just inside the right edge rather than clipping it.
+    x = MAX(0.0, MIN(x, CGRectGetWidth(actionsView.bounds) - size));
+    y = MAX(0.0, MIN(y, CGRectGetHeight(actionsView.bounds) - size));
+
+    button.frame = CGRectIntegral(CGRectMake(x, y, size, size));
+    button.tintColor = shareButton.tintColor ?: UIColor.labelColor;
+    button.hidden = NO;
+    button.userInteractionEnabled = YES;
+    [actionsView bringSubviewToFront:button];
+}
+
+static void BHTActionsLayoutSubviews(id self, SEL _cmd) {
+    if (BHTOriginalActionsLayoutIMP) {
+        ((BHTLayoutIMP)BHTOriginalActionsLayoutIMP)(self, _cmd);
+    }
+
+    if ([self isKindOfClass:[UIView class]]) {
+        BHTLayoutVideoDownloadButton((UIView *)self);
     }
 }
 
 static void BHTInstallX1216VideoCompat(void) {
-    Class cls = NSClassFromString(@"TTAStatusInlineShareButton");
-    SEL selector = NSSelectorFromString(@"didLongPressActionButton:");
+    Class cls = NSClassFromString(@"TTAStatusInlineActionsView");
+    SEL selector = @selector(layoutSubviews);
     if (!cls) {
-        NSLog(@"[BHTwitter][X12.16] TTAStatusInlineShareButton not found");
+        NSLog(@"[BHTwitter][X12.16] TTAStatusInlineActionsView not found");
         return;
     }
 
     Method inheritedMethod = class_getInstanceMethod(cls, selector);
     if (!inheritedMethod) {
-        NSLog(@"[BHTwitter][X12.16] didLongPressActionButton: not found in hierarchy");
+        NSLog(@"[BHTwitter][X12.16] layoutSubviews not found for actions view");
         return;
     }
 
-    BHTInheritedShareLongPressIMP = method_getImplementation(inheritedMethod);
+    BHTOriginalActionsLayoutIMP = method_getImplementation(inheritedMethod);
     const char *types = method_getTypeEncoding(inheritedMethod);
 
-    // Critical: add an override to TTAStatusInlineShareButton itself. Do not
-    // method_setImplementation() on an inherited Method because that can modify
-    // the superclass implementation and affect unrelated inline-action buttons.
-    if (class_addMethod(cls, selector, (IMP)BHTX1216ShareLongPress, types)) {
-        NSLog(@"[BHTwitter][X12.16] Installed class-local native long-press download override");
+    // Prefer a class-local override so UIView/superclass implementations are
+    // never replaced globally.
+    if (class_addMethod(cls, selector, (IMP)BHTActionsLayoutSubviews, types)) {
+        NSLog(@"[BHTwitter][X12.16] Installed dedicated download-button layout override");
         return;
     }
 
-    // If the class already owns the method (for example another tweak added it),
-    // replace only that class-local implementation.
     unsigned int count = 0;
     Method *methods = class_copyMethodList(cls, &count);
     Method ownMethod = NULL;
@@ -92,11 +155,11 @@ static void BHTInstallX1216VideoCompat(void) {
     free(methods);
 
     if (ownMethod) {
-        BHTInheritedShareLongPressIMP = method_getImplementation(ownMethod);
-        method_setImplementation(ownMethod, (IMP)BHTX1216ShareLongPress);
-        NSLog(@"[BHTwitter][X12.16] Replaced class-local native long-press implementation");
+        BHTOriginalActionsLayoutIMP = method_getImplementation(ownMethod);
+        method_setImplementation(ownMethod, (IMP)BHTActionsLayoutSubviews);
+        NSLog(@"[BHTwitter][X12.16] Replaced class-local actions layout implementation");
     } else {
-        NSLog(@"[BHTwitter][X12.16] Could not install class-local long-press override");
+        NSLog(@"[BHTwitter][X12.16] Could not install actions layout override");
     }
 }
 
