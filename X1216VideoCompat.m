@@ -84,9 +84,6 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     return nil;
 }
 
-// BHDownloadInlineButton's legacy DownloadHandler expects delegate.viewModel and
-// delegate.delegate. X 12.16's dedicated button is not an inline-action child,
-// so provide exactly that interface without depending on the old view hierarchy.
 @interface BHTDownloadDelegateProxy : NSObject
 @property (nonatomic, strong) id viewModel;
 @property (nonatomic, weak) id delegate;
@@ -125,9 +122,7 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     SEL viewModelSEL = NSSelectorFromString(@"viewModel");
     if (actionsView && [actionsView respondsToSelector:viewModelSEL]) {
         id liveModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, viewModelSEL);
-        if (liveModel && BHTRuntimeItemIsVideo(liveModel)) {
-            viewModel = liveModel;
-        }
+        if (liveModel && BHTRuntimeItemIsVideo(liveModel)) viewModel = liveModel;
     }
 
     if (!viewModel) viewModel = BHTVideoViewModelForCell(cell);
@@ -141,16 +136,8 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
     downloadButton.delegate = (id)proxy;
     downloadButton.viewModel = viewModel;
 
-    // Both properties above are weak/temporary in the legacy inline-action path.
-    // Keep the bridge and downloader alive until the menu/download flow finishes.
-    objc_setAssociatedObject(sender,
-                             BHTActiveDownloadProxyKey,
-                             proxy,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    objc_setAssociatedObject(sender,
-                             BHTActiveDownloaderKey,
-                             downloadButton,
-                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sender, BHTActiveDownloadProxyKey, proxy, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(sender, BHTActiveDownloaderKey, downloadButton, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     dispatch_async(dispatch_get_main_queue(), ^{
         [downloadButton DownloadHandler:sender];
@@ -158,6 +145,72 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
 }
 
 @end
+
+static NSArray<NSDictionary *> *BHTNativeActionCandidates(UIView *host) {
+    if (!host) return @[];
+
+    NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:host];
+    CGFloat hostHeight = CGRectGetHeight(host.bounds);
+
+    while (stack.count) {
+        UIView *view = stack.lastObject;
+        [stack removeLastObject];
+
+        if (view != host && view.tag != BHTVideoDownloadButtonTag && !view.hidden && view.alpha > 0.05 && view.superview) {
+            BOOL controlLike = [view isKindOfClass:[UIControl class]];
+            NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
+            controlLike = controlLike || [className containsString:@"button"] || [className containsString:@"control"];
+
+            if (controlLike) {
+                CGRect frame = [view.superview convertRect:view.frame toView:host];
+                CGFloat w = CGRectGetWidth(frame);
+                CGFloat h = CGRectGetHeight(frame);
+                CGFloat midY = CGRectGetMidY(frame);
+                BOOL sizeOK = w >= 24.0 && w <= 72.0 && h >= 24.0 && h <= 72.0;
+                BOOL lowerHalf = midY >= MAX(32.0, hostHeight * 0.45) && midY <= hostHeight - 2.0;
+                if (sizeOK && lowerHalf) {
+                    [items addObject:@{ @"view": view, @"frame": [NSValue valueWithCGRect:frame] }];
+                }
+            }
+        }
+        [stack addObjectsFromArray:view.subviews];
+    }
+
+    return items;
+}
+
+static BOOL BHTFindRightActionPair(UIView *host, CGRect *leftFrameOut, CGRect *rightFrameOut) {
+    NSArray<NSDictionary *> *items = BHTNativeActionCandidates(host);
+    if (items.count < 2) return NO;
+
+    CGFloat lowestMidY = -CGFLOAT_MAX;
+    for (NSDictionary *item in items) {
+        CGRect f = [item[@"frame"] CGRectValue];
+        lowestMidY = MAX(lowestMidY, CGRectGetMidY(f));
+    }
+
+    NSMutableArray<NSValue *> *row = [NSMutableArray array];
+    for (NSDictionary *item in items) {
+        CGRect f = [item[@"frame"] CGRectValue];
+        if (fabs(CGRectGetMidY(f) - lowestMidY) <= 24.0) [row addObject:item[@"frame"]];
+    }
+    if (row.count < 2) return NO;
+
+    [row sortUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
+        CGFloat ax = CGRectGetMidX(a.CGRectValue);
+        CGFloat bx = CGRectGetMidX(b.CGRectValue);
+        if (ax < bx) return NSOrderedAscending;
+        if (ax > bx) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+
+    CGRect right = row.lastObject.CGRectValue;
+    CGRect left = row[row.count - 2].CGRectValue;
+    if (leftFrameOut) *leftFrameOut = left;
+    if (rightFrameOut) *rightFrameOut = right;
+    return YES;
+}
 
 static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     if (!cell) return;
@@ -179,7 +232,9 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
         button.accessibilityLabel = @"動画をダウンロード";
 
         UIImageSymbolConfiguration *config =
-            [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightRegular];
+            [UIImageSymbolConfiguration configurationWithPointSize:17.0
+                                                            weight:UIImageSymbolWeightRegular
+                                                             scale:UIImageSymbolScaleMedium];
         UIImage *image = [UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:config];
         if (!image) image = [UIImage systemImageNamed:@"arrow.down" withConfiguration:config];
         [button setImage:image forState:UIControlStateNormal];
@@ -190,15 +245,33 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
         [host addSubview:button];
     }
 
-    const CGFloat size = 30.0;
-    const CGFloat rightInset = 28.0;
-    const CGFloat bottomInset = 12.0;
+    const CGFloat hitSize = 32.0;
     CGFloat width = CGRectGetWidth(host.bounds);
     CGFloat height = CGRectGetHeight(host.bounds);
+    CGRect leftAction = CGRectZero;
+    CGRect rightAction = CGRectZero;
+    CGRect frame = CGRectZero;
 
-    CGFloat x = MAX(8.0, width - rightInset - size);
-    CGFloat y = MAX(8.0, height - bottomInset - size);
-    button.frame = CGRectIntegral(CGRectMake(x, y, size, size));
+    if (BHTFindRightActionPair(host, &leftAction, &rightAction)) {
+        CGFloat centerX = (CGRectGetMidX(leftAction) + CGRectGetMidX(rightAction)) * 0.5;
+        CGFloat centerY = (CGRectGetMidY(leftAction) + CGRectGetMidY(rightAction)) * 0.5;
+        frame = CGRectMake(centerX - hitSize * 0.5,
+                           centerY - hitSize * 0.5,
+                           hitSize,
+                           hitSize);
+    } else {
+        // Fallback is deliberately lower than the previous implementation so
+        // timeline cells align with X's native action baseline. On tweet detail
+        // cells, keeping the button in the action band avoids the metadata row.
+        CGFloat x = MAX(8.0, width - 72.0);
+        CGFloat y = MAX(8.0, height - 40.0);
+        frame = CGRectMake(x, y, hitSize, hitSize);
+    }
+
+    frame.origin.x = MAX(8.0, MIN(frame.origin.x, MAX(8.0, width - hitSize - 8.0)));
+    frame.origin.y = MAX(8.0, MIN(frame.origin.y, MAX(8.0, height - hitSize - 6.0)));
+
+    button.frame = CGRectIntegral(frame);
     button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
     button.hidden = NO;
     button.alpha = 1.0;
@@ -209,17 +282,9 @@ static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
 static void BHTScheduleVideoButtonEvaluation(UITableViewCell *cell) {
     if (!cell) return;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
-        BHTApplyVideoButtonToCell(cell);
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTApplyVideoButtonToCell(cell);
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.60 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        BHTApplyVideoButtonToCell(cell);
-    });
+    dispatch_async(dispatch_get_main_queue(), ^{ BHTApplyVideoButtonToCell(cell); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ BHTApplyVideoButtonToCell(cell); });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.60 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ BHTApplyVideoButtonToCell(cell); });
 }
 
 static UITableViewCell *BHTVideoTableCellForItem(id self, SEL _cmd, id item, id indexPath) {
@@ -272,7 +337,7 @@ static void BHTInstallVideoTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed video download button with delegate proxy");
+    NSLog(@"[BHTwitter][X12.16] Installed video download button with native-row alignment");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
