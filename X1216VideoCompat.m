@@ -4,75 +4,93 @@
 #import "BHTManager.h"
 #import "BHDownloadInlineButton.h"
 
-static IMP BHTOriginalShareLongPressIMP = NULL;
+static const void *BHTVideoLongPressKey = &BHTVideoLongPressKey;
 
-typedef void (*BHTShareLongPressIMP)(id, SEL, UILongPressGestureRecognizer *);
+@interface BHTVideoLongPressTarget : NSObject
+@end
 
-static void BHTX1216ShareLongPress(id self, SEL _cmd, UILongPressGestureRecognizer *gestureRecognizer) {
-    if (gestureRecognizer.state == UIGestureRecognizerStateBegan && [BHTManager DownloadingVideos]) {
-        id actionsView = nil;
+@implementation BHTVideoLongPressTarget
++ (instancetype)sharedTarget {
+    static BHTVideoLongPressTarget *target;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ target = [BHTVideoLongPressTarget new]; });
+    return target;
+}
 
-        // X 12.16 immersive timeline still embeds TTAStatusInlineShareButton
-        // directly inside TTAStatusInlineActionsView. Prefer the real superview
-        // observed with FLEX, then fall back to the button delegate.
-        if ([self respondsToSelector:@selector(superview)]) {
-            UIView *superview = ((UIView *(*)(id, SEL))objc_msgSend)(self, @selector(superview));
-            if ([superview isKindOfClass:NSClassFromString(@"TTAStatusInlineActionsView")]) {
-                actionsView = superview;
-            }
-        }
+- (void)bht_handleVideoLongPress:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
+    if (![BHTManager DownloadingVideos]) return;
 
-        if (!actionsView && [self respondsToSelector:NSSelectorFromString(@"delegate")]) {
-            actionsView = ((id (*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"delegate"));
-        }
+    UIView *shareButton = gesture.view;
+    if (!shareButton) return;
 
-        id viewModel = nil;
-        if (actionsView && [actionsView respondsToSelector:NSSelectorFromString(@"viewModel")]) {
-            viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, NSSelectorFromString(@"viewModel"));
-        }
-
-        if (viewModel && [BHTManager isVideoCell:viewModel]) {
-            NSLog(@"[BHTwitter][X12.16] Video long press detected. viewModel=%@", NSStringFromClass([viewModel class]));
-
-            BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
-            downloadButton.delegate = (id)actionsView;
-            downloadButton.viewModel = viewModel;
-            [downloadButton DownloadHandler:nil];
-            return;
+    id actionsView = shareButton.superview;
+    if (![actionsView isKindOfClass:NSClassFromString(@"TTAStatusInlineActionsView")]) {
+        if ([shareButton respondsToSelector:NSSelectorFromString(@"delegate")]) {
+            actionsView = ((id (*)(id, SEL))objc_msgSend)(shareButton, NSSelectorFromString(@"delegate"));
         }
     }
 
-    if (BHTOriginalShareLongPressIMP) {
-        ((BHTShareLongPressIMP)BHTOriginalShareLongPressIMP)(self, _cmd, gestureRecognizer);
+    if (!actionsView || ![actionsView respondsToSelector:NSSelectorFromString(@"viewModel")]) return;
+
+    id viewModel = ((id (*)(id, SEL))objc_msgSend)(actionsView, NSSelectorFromString(@"viewModel"));
+    if (!viewModel || ![BHTManager isVideoCell:viewModel]) return;
+
+    NSLog(@"[BHTwitter][X12.16] Direct video long press fired: %@", NSStringFromClass([viewModel class]));
+
+    BHDownloadInlineButton *downloadButton = [[BHDownloadInlineButton alloc] initWithFrame:CGRectZero];
+    downloadButton.delegate = (id)actionsView;
+    downloadButton.viewModel = viewModel;
+    [downloadButton DownloadHandler:nil];
+}
+@end
+
+static IMP BHTOriginalShareDidMoveToWindowIMP = NULL;
+typedef void (*BHTVoidIMP)(id, SEL);
+
+static void BHTShareDidMoveToWindow(id self, SEL _cmd) {
+    if (BHTOriginalShareDidMoveToWindowIMP) {
+        ((BHTVoidIMP)BHTOriginalShareDidMoveToWindowIMP)(self, _cmd);
     }
+
+    if (![self isKindOfClass:[UIView class]]) return;
+    UIView *view = (UIView *)self;
+    if (!view.window) return;
+    if (objc_getAssociatedObject(self, BHTVideoLongPressKey)) return;
+
+    UILongPressGestureRecognizer *gesture = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:[BHTVideoLongPressTarget sharedTarget]
+                action:@selector(bht_handleVideoLongPress:)];
+    gesture.minimumPressDuration = 0.45;
+    gesture.cancelsTouchesInView = YES;
+    gesture.delaysTouchesBegan = YES;
+    [view addGestureRecognizer:gesture];
+    objc_setAssociatedObject(self, BHTVideoLongPressKey, gesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    NSLog(@"[BHTwitter][X12.16] Attached direct long-press recognizer to share button");
 }
 
 static void BHTInstallX1216VideoCompat(void) {
     Class cls = NSClassFromString(@"TTAStatusInlineShareButton");
-    SEL selector = NSSelectorFromString(@"didLongPressActionButton:");
+    SEL selector = @selector(didMoveToWindow);
     Method method = cls ? class_getInstanceMethod(cls, selector) : NULL;
 
     if (!method) {
-        NSLog(@"[BHTwitter][X12.16] Could not find TTAStatusInlineShareButton didLongPressActionButton:");
+        NSLog(@"[BHTwitter][X12.16] Could not hook TTAStatusInlineShareButton didMoveToWindow");
         return;
     }
 
     IMP current = method_getImplementation(method);
-    IMP replacement = (IMP)BHTX1216ShareLongPress;
+    IMP replacement = (IMP)BHTShareDidMoveToWindow;
+    if (current == replacement) return;
 
-    if (current == replacement) {
-        return;
-    }
-
-    BHTOriginalShareLongPressIMP = current;
+    BHTOriginalShareDidMoveToWindowIMP = current;
     method_setImplementation(method, replacement);
-    NSLog(@"[BHTwitter][X12.16] Installed video download long-press fallback");
+    NSLog(@"[BHTwitter][X12.16] Installed direct share-button gesture fallback");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
-    // Install after Logos hooks have initialized, so the saved implementation
-    // remains the complete original BHTwitter/X behavior for non-video cases.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         BHTInstallX1216VideoCompat();
     });
 }
