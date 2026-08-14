@@ -31,6 +31,7 @@ static BOOL BHTRuntimeItemIsVideo(id item) {
                     NSInteger mediaType = ((NSInteger (*)(id, SEL))objc_msgSend)(media, mediaTypeSEL);
                     if (mediaType == 2 || mediaType == 3) return YES;
                 }
+
                 SEL videoInfoSEL = NSSelectorFromString(@"videoInfo");
                 if ([media respondsToSelector:videoInfoSEL] && ((id (*)(id, SEL))objc_msgSend)(media, videoInfoSEL)) return YES;
             }
@@ -146,58 +147,46 @@ static id BHTVideoViewModelForCell(UITableViewCell *cell) {
 
 @end
 
-static NSArray<NSDictionary *> *BHTNativeActionCandidates(UIView *host) {
-    if (!host) return @[];
+static NSArray<NSValue *> *BHTNativeActionFramesInsideView(UIView *actionsView) {
+    if (!actionsView) return @[];
 
-    NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
-    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:host];
-    CGFloat hostHeight = CGRectGetHeight(host.bounds);
+    NSMutableArray<NSValue *> *frames = [NSMutableArray array];
+    NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:actionsView];
 
     while (stack.count) {
         UIView *view = stack.lastObject;
         [stack removeLastObject];
 
-        if (view != host && view.tag != BHTVideoDownloadButtonTag && !view.hidden && view.alpha > 0.05 && view.superview) {
+        if (view != actionsView &&
+            view.tag != BHTVideoDownloadButtonTag &&
+            !view.hidden &&
+            view.alpha > 0.05 &&
+            view.superview) {
+
             BOOL controlLike = [view isKindOfClass:[UIControl class]];
             NSString *className = NSStringFromClass(view.class).lowercaseString ?: @"";
             controlLike = controlLike || [className containsString:@"button"] || [className containsString:@"control"];
 
             if (controlLike) {
-                CGRect frame = [view.superview convertRect:view.frame toView:host];
+                CGRect frame = [view.superview convertRect:view.frame toView:actionsView];
                 CGFloat w = CGRectGetWidth(frame);
                 CGFloat h = CGRectGetHeight(frame);
                 CGFloat midY = CGRectGetMidY(frame);
-                BOOL sizeOK = w >= 24.0 && w <= 72.0 && h >= 24.0 && h <= 72.0;
-                BOOL lowerHalf = midY >= MAX(32.0, hostHeight * 0.45) && midY <= hostHeight - 2.0;
-                if (sizeOK && lowerHalf) {
-                    [items addObject:@{ @"view": view, @"frame": [NSValue valueWithCGRect:frame] }];
+
+                BOOL sizeOK = w >= 22.0 && w <= 80.0 && h >= 22.0 && h <= 80.0;
+                BOOL inside = CGRectIntersectsRect(CGRectInset(actionsView.bounds, -8.0, -8.0), frame);
+                BOOL verticalOK = midY >= -4.0 && midY <= CGRectGetHeight(actionsView.bounds) + 4.0;
+
+                if (sizeOK && inside && verticalOK) {
+                    [frames addObject:[NSValue valueWithCGRect:frame]];
                 }
             }
         }
+
         [stack addObjectsFromArray:view.subviews];
     }
 
-    return items;
-}
-
-static BOOL BHTFindRightActionPair(UIView *host, CGRect *leftFrameOut, CGRect *rightFrameOut) {
-    NSArray<NSDictionary *> *items = BHTNativeActionCandidates(host);
-    if (items.count < 2) return NO;
-
-    CGFloat lowestMidY = -CGFLOAT_MAX;
-    for (NSDictionary *item in items) {
-        CGRect f = [item[@"frame"] CGRectValue];
-        lowestMidY = MAX(lowestMidY, CGRectGetMidY(f));
-    }
-
-    NSMutableArray<NSValue *> *row = [NSMutableArray array];
-    for (NSDictionary *item in items) {
-        CGRect f = [item[@"frame"] CGRectValue];
-        if (fabs(CGRectGetMidY(f) - lowestMidY) <= 24.0) [row addObject:item[@"frame"]];
-    }
-    if (row.count < 2) return NO;
-
-    [row sortUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
+    [frames sortUsingComparator:^NSComparisonResult(NSValue *a, NSValue *b) {
         CGFloat ax = CGRectGetMidX(a.CGRectValue);
         CGFloat bx = CGRectGetMidX(b.CGRectValue);
         if (ax < bx) return NSOrderedAscending;
@@ -205,78 +194,115 @@ static BOOL BHTFindRightActionPair(UIView *host, CGRect *leftFrameOut, CGRect *r
         return NSOrderedSame;
     }];
 
-    CGRect right = row.lastObject.CGRectValue;
-    CGRect left = row[row.count - 2].CGRectValue;
-    if (leftFrameOut) *leftFrameOut = left;
-    if (rightFrameOut) *rightFrameOut = right;
+    return frames;
+}
+
+static BOOL BHTFindBookmarkShareGap(UIView *actionsView, CGPoint *centerOut) {
+    NSArray<NSValue *> *frames = BHTNativeActionFramesInsideView(actionsView);
+    if (frames.count < 2) return NO;
+
+    // The two right-most native controls are the stable anchor pair on X 12.16:
+    // bookmark and share. Place the download button exactly halfway between them.
+    CGRect left = frames[frames.count - 2].CGRectValue;
+    CGRect right = frames.lastObject.CGRectValue;
+
+    CGFloat leftMidY = CGRectGetMidY(left);
+    CGFloat rightMidY = CGRectGetMidY(right);
+    if (fabs(leftMidY - rightMidY) > 12.0) return NO;
+
+    CGFloat gap = CGRectGetMidX(right) - CGRectGetMidX(left);
+    if (gap < 34.0 || gap > 150.0) return NO;
+
+    if (centerOut) {
+        *centerOut = CGPointMake((CGRectGetMidX(left) + CGRectGetMidX(right)) * 0.5,
+                                 (leftMidY + rightMidY) * 0.5);
+    }
     return YES;
+}
+
+static UIButton *BHTEnsureVideoButton(UIView *actionsView) {
+    if (!actionsView) return nil;
+
+    UIButton *button = (UIButton *)[actionsView viewWithTag:BHTVideoDownloadButtonTag];
+    if (button) return button;
+
+    button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.tag = BHTVideoDownloadButtonTag;
+    button.backgroundColor = UIColor.clearColor;
+    button.tintColor = UIColor.secondaryLabelColor;
+    button.accessibilityLabel = @"動画をダウンロード";
+
+    UIImageSymbolConfiguration *config =
+        [UIImageSymbolConfiguration configurationWithPointSize:17.0
+                                                        weight:UIImageSymbolWeightRegular
+                                                         scale:UIImageSymbolScaleMedium];
+    UIImage *image = [UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:config];
+    if (!image) image = [UIImage systemImageNamed:@"arrow.down" withConfiguration:config];
+    [button setImage:image forState:UIControlStateNormal];
+
+    [button addTarget:[BHTVideoDownloadTarget sharedTarget]
+               action:@selector(bht_downloadVideoTapped:)
+     forControlEvents:UIControlEventTouchUpInside];
+
+    [actionsView addSubview:button];
+    return button;
+}
+
+static void BHTRemoveOldVideoButtonFromCell(UITableViewCell *cell, UIView *actionsView) {
+    if (!cell) return;
+
+    UIView *host = cell.contentView ?: cell;
+    UIView *legacyButton = [host viewWithTag:BHTVideoDownloadButtonTag];
+    if (legacyButton && legacyButton.superview != actionsView) {
+        [legacyButton removeFromSuperview];
+    }
 }
 
 static void BHTApplyVideoButtonToCell(UITableViewCell *cell) {
     if (!cell) return;
 
-    UIView *host = cell.contentView ?: cell;
-    UIButton *button = (UIButton *)[host viewWithTag:BHTVideoDownloadButtonTag];
+    UIView *actionsView = BHTFindActionsView(cell);
     id viewModel = BHTVideoViewModelForCell(cell);
 
-    if (!viewModel) {
-        [button removeFromSuperview];
+    BHTRemoveOldVideoButtonFromCell(cell, actionsView);
+
+    if (!viewModel || !actionsView) {
+        UIView *existing = actionsView ? [actionsView viewWithTag:BHTVideoDownloadButtonTag] : nil;
+        [existing removeFromSuperview];
         return;
     }
 
-    if (!button) {
-        button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.tag = BHTVideoDownloadButtonTag;
-        button.backgroundColor = UIColor.clearColor;
-        button.tintColor = UIColor.secondaryLabelColor;
-        button.accessibilityLabel = @"動画をダウンロード";
-
-        UIImageSymbolConfiguration *config =
-            [UIImageSymbolConfiguration configurationWithPointSize:17.0
-                                                            weight:UIImageSymbolWeightRegular
-                                                             scale:UIImageSymbolScaleMedium];
-        UIImage *image = [UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:config];
-        if (!image) image = [UIImage systemImageNamed:@"arrow.down" withConfiguration:config];
-        [button setImage:image forState:UIControlStateNormal];
-
-        [button addTarget:[BHTVideoDownloadTarget sharedTarget]
-                   action:@selector(bht_downloadVideoTapped:)
-         forControlEvents:UIControlEventTouchUpInside];
-        [host addSubview:button];
-    }
+    UIButton *button = BHTEnsureVideoButton(actionsView);
+    if (!button) return;
 
     const CGFloat hitSize = 32.0;
-    CGFloat width = CGRectGetWidth(host.bounds);
-    CGFloat height = CGRectGetHeight(host.bounds);
-    CGRect leftAction = CGRectZero;
-    CGRect rightAction = CGRectZero;
-    CGRect frame = CGRectZero;
+    CGPoint center = CGPointZero;
 
-    if (BHTFindRightActionPair(host, &leftAction, &rightAction)) {
-        CGFloat centerX = (CGRectGetMidX(leftAction) + CGRectGetMidX(rightAction)) * 0.5;
-        CGFloat centerY = (CGRectGetMidY(leftAction) + CGRectGetMidY(rightAction)) * 0.5;
-        frame = CGRectMake(centerX - hitSize * 0.5,
-                           centerY - hitSize * 0.5,
-                           hitSize,
-                           hitSize);
+    if (BHTFindBookmarkShareGap(actionsView, &center)) {
+        button.frame = CGRectIntegral(CGRectMake(center.x - hitSize * 0.5,
+                                                 center.y - hitSize * 0.5,
+                                                 hitSize,
+                                                 hitSize));
     } else {
-        // Fallback is deliberately lower than the previous implementation so
-        // timeline cells align with X's native action baseline. On tweet detail
-        // cells, keeping the button in the action band avoids the metadata row.
-        CGFloat x = MAX(8.0, width - 72.0);
-        CGFloat y = MAX(8.0, height - 40.0);
-        frame = CGRectMake(x, y, hitSize, hitSize);
+        // Fallback stays inside the native action bar rather than using the cell
+        // bottom. This prevents collisions with detail-only rows such as quotes.
+        CGFloat width = CGRectGetWidth(actionsView.bounds);
+        CGFloat height = CGRectGetHeight(actionsView.bounds);
+        CGFloat centerX = MAX(hitSize * 0.5 + 4.0, width - 70.0);
+        CGFloat centerY = MAX(hitSize * 0.5, height * 0.5);
+        button.frame = CGRectIntegral(CGRectMake(centerX - hitSize * 0.5,
+                                                 centerY - hitSize * 0.5,
+                                                 hitSize,
+                                                 hitSize));
     }
 
-    frame.origin.x = MAX(8.0, MIN(frame.origin.x, MAX(8.0, width - hitSize - 8.0)));
-    frame.origin.y = MAX(8.0, MIN(frame.origin.y, MAX(8.0, height - hitSize - 6.0)));
-
-    button.frame = CGRectIntegral(frame);
-    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    button.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin |
+                              UIViewAutoresizingFlexibleTopMargin |
+                              UIViewAutoresizingFlexibleBottomMargin;
     button.hidden = NO;
     button.alpha = 1.0;
     button.userInteractionEnabled = YES;
-    [host bringSubviewToFront:button];
+    [actionsView bringSubviewToFront:button];
 }
 
 static void BHTScheduleVideoButtonEvaluation(UITableViewCell *cell) {
@@ -337,7 +363,7 @@ static void BHTInstallVideoTimelineHook(void) {
         class_addMethod(cls, selector, (IMP)BHTVideoTableCellForItem, types);
     }
 
-    NSLog(@"[BHTwitter][X12.16] Installed video download button with native-row alignment");
+    NSLog(@"[BHTwitter][X12.16] Installed video download button anchored to native action bar");
 }
 
 __attribute__((constructor)) static void BHTX1216VideoCompatInit(void) {
