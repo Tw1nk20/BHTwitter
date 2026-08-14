@@ -153,9 +153,6 @@ static id BHTShareViewModelForShareView(UIView *shareView) {
         id model = BHTShareVideoModelFromObject(ancestor);
         if (model) return model;
 
-        // Detail/reply layouts often keep the model on a sibling or wrapper.
-        // Search the nearest reasonably sized tweet subtree instead of relying
-        // on a single private class name.
         if (CGRectGetWidth(ancestor.bounds) >= 250.0 && CGRectGetHeight(ancestor.bounds) >= 100.0) {
             model = BHTFindVideoModelInViewTree(ancestor);
             if (model) return model;
@@ -163,6 +160,57 @@ static id BHTShareViewModelForShareView(UIView *shareView) {
     }
 
     return nil;
+}
+
+static UIViewController *BHTTopViewController(void) {
+    UIWindow *window = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (scene.activationState != UISceneActivationStateForegroundActive ||
+            ![scene isKindOfClass:[UIWindowScene class]]) continue;
+
+        for (UIWindow *candidate in ((UIWindowScene *)scene).windows) {
+            if (candidate.isKeyWindow) {
+                window = candidate;
+                break;
+            }
+        }
+        if (window) break;
+    }
+
+    if (!window) window = UIApplication.sharedApplication.keyWindow;
+    UIViewController *controller = window.rootViewController;
+    while (controller) {
+        if (controller.presentedViewController) {
+            controller = controller.presentedViewController;
+            continue;
+        }
+        if ([controller isKindOfClass:[UINavigationController class]]) {
+            controller = ((UINavigationController *)controller).visibleViewController;
+            continue;
+        }
+        if ([controller isKindOfClass:[UITabBarController class]]) {
+            controller = ((UITabBarController *)controller).selectedViewController;
+            continue;
+        }
+        break;
+    }
+    return controller;
+}
+
+static void BHTShowNoVideoError(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *controller = BHTTopViewController();
+        if (!controller) return;
+
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:nil
+                                                message:@"This post does not contain a video"
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+        [controller presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 @interface BHTShareDownloadProxy : NSObject
@@ -199,12 +247,21 @@ static id BHTShareViewModelForShareView(UIView *shareView) {
     if (!viewModel) {
         NSLog(@"[BHTwitter][X12.16] Share long press: video model not found (%@ / %@)",
               NSStringFromClass(shareView.class), shareView.accessibilityLabel);
+
+        for (UIGestureRecognizer *other in shareView.gestureRecognizers.copy) {
+            if (other != gesture) other.enabled = NO;
+        }
+
+        BHTShowNoVideoError();
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            for (UIGestureRecognizer *other in shareView.gestureRecognizers.copy) {
+                if (other != gesture) other.enabled = YES;
+            }
+        });
         return;
     }
 
-    // Once BHTwitter has positively identified a video post, suppress other
-    // recognizers on this control for this gesture so the native long-press
-    // sheet does not win over the download menu.
     for (UIGestureRecognizer *other in shareView.gestureRecognizers.copy) {
         if (other != gesture) other.enabled = NO;
     }
